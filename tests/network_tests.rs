@@ -10,7 +10,9 @@ use zero_network::{
     MockHostSocket, NetworkError, StageInviteRequest, MAX_BURNED_UUIDS, MAX_DROP_BODY_BYTES,
 };
 use zero_protocol::crypto::{compute_invite_token, X25519Keypair};
-use zero_protocol::{from_json_str, to_json_bytes, to_json_string, DropPayload, InvitePayload, SdpAnswer, SdpOffer};
+use zero_protocol::{
+    from_json_str, to_json_bytes, to_json_string, DropPayload, InvitePayload, SdpAnswer, SdpOffer,
+};
 
 fn sample_invite_payload(
     do_id: &str,
@@ -512,8 +514,8 @@ fn test_stage_invite_and_match_atomic_consumption() {
     let room_state = EphemeralRoomState::new();
 
     // 1. Initial match with no staged invites -> 200 OK with MatchResponse::Empty
-    let match_res_empty = process_match_request(&room_state, &mut sockets, 0)
-        .expect("match request should succeed");
+    let match_res_empty =
+        process_match_request(&room_state, &mut sockets, 0).expect("match request should succeed");
     assert_eq!(match_res_empty.status, 200);
     let decoded_empty: MatchResponse =
         from_json_str(&match_res_empty.body).expect("deserialize MatchResponse::Empty");
@@ -557,8 +559,8 @@ fn test_stage_invite_and_match_atomic_consumption() {
     assert_eq!(att_after.staged_invite, None);
 
     // 5. Subsequent match request is Empty
-    let match_res_empty2 = process_match_request(&room_state, &mut sockets, 0)
-        .expect("second match should be empty");
+    let match_res_empty2 =
+        process_match_request(&room_state, &mut sockets, 0).expect("second match should be empty");
     let decoded_empty2: MatchResponse =
         from_json_str(&match_res_empty2.body).expect("deserialize MatchResponse::Empty");
     assert_eq!(decoded_empty2, MatchResponse::Empty);
@@ -591,38 +593,26 @@ fn test_stage_invite_authorization_and_hmac_validation() {
     // 2. Secret does not match any connected host socket -> 404 HostSocketUnavailable
     let wrong_host_secret = [0x99u8; 32];
     let wrong_hex = hex::encode(wrong_host_secret);
-    let err_wrong_sock = process_stage_invite(
-        Some(&wrong_hex),
-        &valid_bytes,
-        &room_state,
-        &mut sockets,
-    )
-    .expect_err("unknown host secret socket must fail");
+    let err_wrong_sock =
+        process_stage_invite(Some(&wrong_hex), &valid_bytes, &room_state, &mut sockets)
+            .expect_err("unknown host secret socket must fail");
     assert_eq!(err_wrong_sock, NetworkError::HostSocketUnavailable);
     assert_eq!(err_wrong_sock.status_code(), 404);
 
     // 3. Tampered token in InvitePayload -> 403 Forbidden
-    let tampered_invite = sample_invite_payload("room-beta", invite_uuid, "deadbeef-bad-hmac", [0x44u8; 32]);
+    let tampered_invite =
+        sample_invite_payload("room-beta", invite_uuid, "deadbeef-bad-hmac", [0x44u8; 32]);
     let tampered_bytes = to_json_bytes(&tampered_invite).expect("serialize tampered");
-    let err_tampered = process_stage_invite(
-        Some(&host_hex),
-        &tampered_bytes,
-        &room_state,
-        &mut sockets,
-    )
-    .expect_err("tampered HMAC must fail");
+    let err_tampered =
+        process_stage_invite(Some(&host_hex), &tampered_bytes, &room_state, &mut sockets)
+            .expect_err("tampered HMAC must fail");
     assert_eq!(err_tampered, NetworkError::ForbiddenHmac);
     assert_eq!(err_tampered.status_code(), 403);
 
     // 4. Burned invite UUID -> 410 Gone
     assert!(room_state.burn_uuid(invite_uuid.to_string()));
-    let err_burned = process_stage_invite(
-        Some(&host_hex),
-        &valid_bytes,
-        &room_state,
-        &mut sockets,
-    )
-    .expect_err("burned invite must fail");
+    let err_burned = process_stage_invite(Some(&host_hex), &valid_bytes, &room_state, &mut sockets)
+        .expect_err("burned invite must fail");
     assert_eq!(err_burned, NetworkError::InviteAlreadyBurned);
     assert_eq!(err_burned.status_code(), 410);
 
@@ -657,8 +647,8 @@ fn test_match_skips_burned_staged_invites() {
     assert!(room_state.burn_uuid(invite_uuid.to_string()));
 
     // Match request must skip the burned staged invite and return Empty
-    let match_res = process_match_request(&room_state, &mut sockets, 0)
-        .expect("match request should succeed");
+    let match_res =
+        process_match_request(&room_state, &mut sockets, 0).expect("match request should succeed");
     let decoded: MatchResponse = from_json_str(&match_res.body).expect("deserialize");
     assert_eq!(decoded, MatchResponse::Empty);
 
@@ -753,9 +743,19 @@ fn test_multi_host_targeted_dead_drop_routing() {
     assert_eq!(res_b.status, 200);
 
     // Verify: STRICTLY socket B received the message; sockets A and C received NOTHING!
-    assert!(sockets[0].sent_messages.is_empty(), "Host A must receive 0 messages");
-    assert_eq!(sockets[1].sent_messages.len(), 1, "Host B must receive exactly 1 message");
-    assert!(sockets[2].sent_messages.is_empty(), "Host C must receive 0 messages");
+    assert!(
+        sockets[0].sent_messages.is_empty(),
+        "Host A must receive 0 messages"
+    );
+    assert_eq!(
+        sockets[1].sent_messages.len(),
+        1,
+        "Host B must receive exactly 1 message"
+    );
+    assert!(
+        sockets[2].sent_messages.is_empty(),
+        "Host C must receive 0 messages"
+    );
 
     let received_b: DropPayload = from_json_str(&sockets[1].sent_messages[0]).unwrap();
     assert_eq!(received_b, payload_b);
@@ -769,9 +769,20 @@ fn test_multi_host_targeted_dead_drop_routing() {
     let res_c = process_dead_drop(uuid_c, None, &bytes_c, &mut room_state, &mut sockets).unwrap();
     assert_eq!(res_c.status, 200);
 
-    assert!(sockets[0].sent_messages.is_empty(), "Host A still has 0 messages");
-    assert_eq!(sockets[1].sent_messages.len(), 1, "Host B still has 1 message");
-    assert_eq!(sockets[2].sent_messages.len(), 1, "Host C received its message");
+    assert!(
+        sockets[0].sent_messages.is_empty(),
+        "Host A still has 0 messages"
+    );
+    assert_eq!(
+        sockets[1].sent_messages.len(),
+        1,
+        "Host B still has 1 message"
+    );
+    assert_eq!(
+        sockets[2].sent_messages.len(),
+        1,
+        "Host C received its message"
+    );
 
     let received_c: DropPayload = from_json_str(&sockets[2].sent_messages[0]).unwrap();
     assert_eq!(received_c, payload_c);
@@ -779,7 +790,9 @@ fn test_multi_host_targeted_dead_drop_routing() {
     // 3. Foreign token not matching ANY host -> 403 Forbidden; none of the sockets receive messages
     let foreign_secret = [0xEEu8; 32];
     let uuid_x = "uuid-foreign";
-    let token_x = compute_invite_token(&foreign_secret, uuid_x).unwrap().hmac_hex;
+    let token_x = compute_invite_token(&foreign_secret, uuid_x)
+        .unwrap()
+        .hmac_hex;
     let payload_x = sample_drop_payload(uuid_x, &token_x);
     let bytes_x = to_json_bytes(&payload_x).unwrap();
 

@@ -253,10 +253,7 @@ pub fn process_match_request<S: HibernatingSocket>(
     if available.is_empty() {
         let resp = MatchResponse::Empty;
         let body = to_json_string(&resp).map_err(|e| NetworkError::SocketError(e.to_string()))?;
-        return Ok(HttpResponse {
-            status: 200,
-            body,
-        });
+        return Ok(HttpResponse { status: 200, body });
     }
 
     let selected_idx = selector_seed % available.len();
@@ -270,10 +267,7 @@ pub fn process_match_request<S: HibernatingSocket>(
 
     let resp = MatchResponse::Matched { invite };
     let body = to_json_string(&resp).map_err(|e| NetworkError::SocketError(e.to_string()))?;
-    Ok(HttpResponse {
-        status: 200,
-        body,
-    })
+    Ok(HttpResponse { status: 200, body })
 }
 
 /// Processes a joiner's dead-drop `POST /drop/:do_id/:invite_uuid`:

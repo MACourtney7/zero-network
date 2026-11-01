@@ -224,7 +224,12 @@ impl DurableObject for DeadDropRoom {
             if let Some(invite) = invite_opt {
                 if let Ok(Some(mut attachment)) = ws.deserialize_attachment::<HostAttachment>() {
                     let room_state = self.ephemeral.borrow();
-                    if verify_invite_token(&attachment.host_secret, &invite.invite_uuid, &invite.token).is_ok()
+                    if verify_invite_token(
+                        &attachment.host_secret,
+                        &invite.invite_uuid,
+                        &invite.token,
+                    )
+                    .is_ok()
                         && !room_state.is_burned(&invite.invite_uuid)
                     {
                         attachment.staged_invite = Some(invite);
