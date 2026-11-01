@@ -5,12 +5,33 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use zero_network::{
     default_ice_servers_json, extract_bearer_token, parse_custom_ice_servers, parse_host_secret,
-    process_dead_drop, process_host_upgrade, process_ice_servers, EphemeralRoomState,
-    HibernatingSocket, HostAttachment, MockHostSocket, NetworkError, MAX_BURNED_UUIDS,
-    MAX_DROP_BODY_BYTES,
+    process_dead_drop, process_host_upgrade, process_ice_servers, process_match_request,
+    process_stage_invite, EphemeralRoomState, HibernatingSocket, HostAttachment, MatchResponse,
+    MockHostSocket, NetworkError, StageInviteRequest, MAX_BURNED_UUIDS, MAX_DROP_BODY_BYTES,
 };
 use zero_protocol::crypto::{compute_invite_token, X25519Keypair};
-use zero_protocol::{from_json_str, to_json_bytes, DropPayload, SdpAnswer};
+use zero_protocol::{from_json_str, to_json_bytes, to_json_string, DropPayload, InvitePayload, SdpAnswer, SdpOffer};
+
+fn sample_invite_payload(
+    do_id: &str,
+    invite_uuid: &str,
+    token: &str,
+    host_pubkey: [u8; 32],
+) -> InvitePayload {
+    InvitePayload {
+        do_id: do_id.to_string(),
+        invite_uuid: invite_uuid.to_string(),
+        token: token.to_string(),
+        sdp_offer: SdpOffer {
+            sdp: "v=0\r\no=- 123 2 IN IP4 127.0.0.1\r\na=setup:actpass\r\n".to_string(),
+        },
+        host_public_key: host_pubkey,
+        guest_private_key: None,
+        host_peer_id: Some("host-peer-1".to_string()),
+        assigned_peer_id: Some("guest-peer-1".to_string()),
+        host_signing_key: None,
+    }
+}
 
 fn sample_drop_payload(invite_uuid: &str, token: &str) -> DropPayload {
     let joiner_kp = X25519Keypair::from_private_key([0x42; 32]);
@@ -43,9 +64,7 @@ fn test_host_upgrade_accepts_hex_and_base64_secrets() {
     assert!(socket_hex.hibernating);
     assert_eq!(
         socket_hex.recover_host_secret().unwrap(),
-        Some(HostAttachment {
-            host_secret: raw_secret
-        })
+        Some(HostAttachment::new(raw_secret))
     );
 
     // 2. Standard Base64 (44 chars) with Bearer prefix
@@ -57,9 +76,7 @@ fn test_host_upgrade_accepts_hex_and_base64_secrets() {
     assert!(socket_b64.hibernating);
     assert_eq!(
         socket_b64.recover_host_secret().unwrap(),
-        Some(HostAttachment {
-            host_secret: raw_secret
-        })
+        Some(HostAttachment::new(raw_secret))
     );
 
     // 3. Base64URL no-pad (43 chars)
@@ -69,9 +86,7 @@ fn test_host_upgrade_accepts_hex_and_base64_secrets() {
     assert_eq!(res_url.status, 101);
     assert_eq!(
         socket_url.recover_host_secret().unwrap(),
-        Some(HostAttachment {
-            host_secret: raw_secret
-        })
+        Some(HostAttachment::new(raw_secret))
     );
 
     // 4. Missing or invalid Upgrade header -> 426 Upgrade Required
@@ -483,4 +498,326 @@ fn test_parse_custom_ice_servers_modes() {
 
     // Primitive number -> None
     assert!(parse_custom_ice_servers("123").is_none());
+}
+
+#[test]
+fn test_stage_invite_and_match_atomic_consumption() {
+    let host_secret = [0x11u8; 32];
+    let host_hex = hex::encode(host_secret);
+    let mut host_socket = MockHostSocket::new();
+    process_host_upgrade(Some("websocket"), Some(&host_hex), &mut host_socket)
+        .expect("host upgrade");
+
+    let mut sockets = vec![host_socket];
+    let room_state = EphemeralRoomState::new();
+
+    // 1. Initial match with no staged invites -> 200 OK with MatchResponse::Empty
+    let match_res_empty = process_match_request(&room_state, &mut sockets, 0)
+        .expect("match request should succeed");
+    assert_eq!(match_res_empty.status, 200);
+    let decoded_empty: MatchResponse =
+        from_json_str(&match_res_empty.body).expect("deserialize MatchResponse::Empty");
+    assert_eq!(decoded_empty, MatchResponse::Empty);
+    assert_eq!(match_res_empty.body, r#"{"status":"empty"}"#);
+
+    // 2. Host stages a valid invite via process_stage_invite
+    let invite_uuid = "staged-invite-001";
+    let token = compute_invite_token(&host_secret, invite_uuid)
+        .expect("compute token")
+        .hmac_hex;
+    let invite = sample_invite_payload("room-alpha", invite_uuid, &token, [0x22u8; 32]);
+    let stage_req = StageInviteRequest {
+        invite: invite.clone(),
+    };
+    let stage_bytes = to_json_bytes(&stage_req).expect("serialize StageInviteRequest");
+
+    let stage_res = process_stage_invite(
+        Some(&format!("Bearer {host_hex}")),
+        &stage_bytes,
+        &room_state,
+        &mut sockets,
+    )
+    .expect("stage invite should succeed");
+    assert_eq!(stage_res.status, 200);
+
+    // Verify attachment now contains staged_invite
+    let att = sockets[0].recover_host_secret().unwrap().unwrap();
+    assert_eq!(att.staged_invite, Some(invite.clone()));
+
+    // 3. Match request selects the staged invite and atomically clears it
+    let match_res = process_match_request(&room_state, &mut sockets, 0)
+        .expect("match request with staged invite");
+    assert_eq!(match_res.status, 200);
+    let decoded_match: MatchResponse =
+        from_json_str(&match_res.body).expect("deserialize MatchResponse::Matched");
+    assert_eq!(decoded_match, MatchResponse::Matched { invite });
+
+    // 4. Verify socket attachment had staged_invite atomically cleared (now None)
+    let att_after = sockets[0].recover_host_secret().unwrap().unwrap();
+    assert_eq!(att_after.staged_invite, None);
+
+    // 5. Subsequent match request is Empty
+    let match_res_empty2 = process_match_request(&room_state, &mut sockets, 0)
+        .expect("second match should be empty");
+    let decoded_empty2: MatchResponse =
+        from_json_str(&match_res_empty2.body).expect("deserialize MatchResponse::Empty");
+    assert_eq!(decoded_empty2, MatchResponse::Empty);
+}
+
+#[test]
+fn test_stage_invite_authorization_and_hmac_validation() {
+    let host_secret = [0x33u8; 32];
+    let host_hex = hex::encode(host_secret);
+    let mut host_socket = MockHostSocket::new();
+    process_host_upgrade(Some("websocket"), Some(&host_hex), &mut host_socket)
+        .expect("host upgrade");
+
+    let mut sockets = vec![host_socket];
+    let mut room_state = EphemeralRoomState::new();
+
+    let invite_uuid = "secure-invite-002";
+    let valid_token = compute_invite_token(&host_secret, invite_uuid)
+        .expect("compute token")
+        .hmac_hex;
+    let valid_invite = sample_invite_payload("room-beta", invite_uuid, &valid_token, [0x44u8; 32]);
+    let valid_bytes = to_json_bytes(&valid_invite).expect("serialize invite");
+
+    // 1. Missing or invalid secret -> 400 Bad Request
+    let err_no_sec = process_stage_invite(None, &valid_bytes, &room_state, &mut sockets)
+        .expect_err("missing secret must fail");
+    assert_eq!(err_no_sec, NetworkError::InvalidHostSecret);
+    assert_eq!(err_no_sec.status_code(), 400);
+
+    // 2. Secret does not match any connected host socket -> 404 HostSocketUnavailable
+    let wrong_host_secret = [0x99u8; 32];
+    let wrong_hex = hex::encode(wrong_host_secret);
+    let err_wrong_sock = process_stage_invite(
+        Some(&wrong_hex),
+        &valid_bytes,
+        &room_state,
+        &mut sockets,
+    )
+    .expect_err("unknown host secret socket must fail");
+    assert_eq!(err_wrong_sock, NetworkError::HostSocketUnavailable);
+    assert_eq!(err_wrong_sock.status_code(), 404);
+
+    // 3. Tampered token in InvitePayload -> 403 Forbidden
+    let tampered_invite = sample_invite_payload("room-beta", invite_uuid, "deadbeef-bad-hmac", [0x44u8; 32]);
+    let tampered_bytes = to_json_bytes(&tampered_invite).expect("serialize tampered");
+    let err_tampered = process_stage_invite(
+        Some(&host_hex),
+        &tampered_bytes,
+        &room_state,
+        &mut sockets,
+    )
+    .expect_err("tampered HMAC must fail");
+    assert_eq!(err_tampered, NetworkError::ForbiddenHmac);
+    assert_eq!(err_tampered.status_code(), 403);
+
+    // 4. Burned invite UUID -> 410 Gone
+    assert!(room_state.burn_uuid(invite_uuid.to_string()));
+    let err_burned = process_stage_invite(
+        Some(&host_hex),
+        &valid_bytes,
+        &room_state,
+        &mut sockets,
+    )
+    .expect_err("burned invite must fail");
+    assert_eq!(err_burned, NetworkError::InviteAlreadyBurned);
+    assert_eq!(err_burned.status_code(), 410);
+
+    // Ensure socket staged_invite was never populated
+    let att = sockets[0].recover_host_secret().unwrap().unwrap();
+    assert_eq!(att.staged_invite, None);
+}
+
+#[test]
+fn test_match_skips_burned_staged_invites() {
+    let host_secret = [0x55u8; 32];
+    let host_hex = hex::encode(host_secret);
+    let mut host_socket = MockHostSocket::new();
+    process_host_upgrade(Some("websocket"), Some(&host_hex), &mut host_socket)
+        .expect("host upgrade");
+
+    let invite_uuid = "pre-burned-invite-003";
+    let token = compute_invite_token(&host_secret, invite_uuid)
+        .expect("token")
+        .hmac_hex;
+    let invite = sample_invite_payload("room-gamma", invite_uuid, &token, [0x66u8; 32]);
+
+    // Attach staged invite directly
+    host_socket
+        .attach_host_secret(&HostAttachment::with_staged_invite(host_secret, invite))
+        .unwrap();
+
+    let mut sockets = vec![host_socket];
+    let mut room_state = EphemeralRoomState::new();
+
+    // Burn the UUID in room state
+    assert!(room_state.burn_uuid(invite_uuid.to_string()));
+
+    // Match request must skip the burned staged invite and return Empty
+    let match_res = process_match_request(&room_state, &mut sockets, 0)
+        .expect("match request should succeed");
+    let decoded: MatchResponse = from_json_str(&match_res.body).expect("deserialize");
+    assert_eq!(decoded, MatchResponse::Empty);
+
+    // Staged invite was NOT cleared because it was skipped
+    let att = sockets[0].recover_host_secret().unwrap().unwrap();
+    assert!(att.staged_invite.is_some());
+}
+
+#[test]
+fn test_match_pseudo_random_distribution_multiple_hosts() {
+    let secret_1 = [0x11u8; 32];
+    let secret_2 = [0x22u8; 32];
+
+    let mut sock_1 = MockHostSocket::new();
+    process_host_upgrade(Some("websocket"), Some(&hex::encode(secret_1)), &mut sock_1)
+        .expect("host 1");
+    let mut sock_2 = MockHostSocket::new();
+    process_host_upgrade(Some("websocket"), Some(&hex::encode(secret_2)), &mut sock_2)
+        .expect("host 2");
+
+    let invite_1 = sample_invite_payload(
+        "room-multi",
+        "inv-1",
+        &compute_invite_token(&secret_1, "inv-1").unwrap().hmac_hex,
+        [0xAA; 32],
+    );
+    let invite_2 = sample_invite_payload(
+        "room-multi",
+        "inv-2",
+        &compute_invite_token(&secret_2, "inv-2").unwrap().hmac_hex,
+        [0xBB; 32],
+    );
+
+    let mut sockets = vec![sock_1, sock_2];
+    let room_state = EphemeralRoomState::new();
+
+    // Stage invites on both hosts
+    process_stage_invite(
+        Some(&hex::encode(secret_1)),
+        &to_json_bytes(&invite_1).unwrap(),
+        &room_state,
+        &mut sockets,
+    )
+    .unwrap();
+    process_stage_invite(
+        Some(&hex::encode(secret_2)),
+        &to_json_bytes(&invite_2).unwrap(),
+        &room_state,
+        &mut sockets,
+    )
+    .unwrap();
+
+    // With selector_seed = 1: 1 % 2 == index 1 (sock_2) selected
+    let res_1 = process_match_request(&room_state, &mut sockets, 1).unwrap();
+    let decoded_1: MatchResponse = from_json_str(&res_1.body).unwrap();
+    assert_eq!(decoded_1, MatchResponse::Matched { invite: invite_2 });
+
+    // Now only sock_1 has a staged invite: next call must return invite_1
+    let res_2 = process_match_request(&room_state, &mut sockets, 5).unwrap();
+    let decoded_2: MatchResponse = from_json_str(&res_2.body).unwrap();
+    assert_eq!(decoded_2, MatchResponse::Matched { invite: invite_1 });
+
+    // Both consumed -> Empty
+    let res_3 = process_match_request(&room_state, &mut sockets, 0).unwrap();
+    let decoded_3: MatchResponse = from_json_str(&res_3.body).unwrap();
+    assert_eq!(decoded_3, MatchResponse::Empty);
+}
+
+#[test]
+fn test_multi_host_targeted_dead_drop_routing() {
+    let secret_a = [0xAAu8; 32];
+    let secret_b = [0xBBu8; 32];
+    let secret_c = [0xCCu8; 32];
+
+    let mut sock_a = MockHostSocket::new();
+    process_host_upgrade(Some("websocket"), Some(&hex::encode(secret_a)), &mut sock_a).unwrap();
+    let mut sock_b = MockHostSocket::new();
+    process_host_upgrade(Some("websocket"), Some(&hex::encode(secret_b)), &mut sock_b).unwrap();
+    let mut sock_c = MockHostSocket::new();
+    process_host_upgrade(Some("websocket"), Some(&hex::encode(secret_c)), &mut sock_c).unwrap();
+
+    let mut sockets = vec![sock_a, sock_b, sock_c];
+    let mut room_state = EphemeralRoomState::new();
+
+    // 1. Joiner sends dead drop targeted at Host B's invite UUID
+    let uuid_b = "uuid-for-host-b";
+    let token_b = compute_invite_token(&secret_b, uuid_b).unwrap().hmac_hex;
+    let payload_b = sample_drop_payload(uuid_b, &token_b);
+    let bytes_b = to_json_bytes(&payload_b).unwrap();
+
+    let res_b = process_dead_drop(uuid_b, None, &bytes_b, &mut room_state, &mut sockets).unwrap();
+    assert_eq!(res_b.status, 200);
+
+    // Verify: STRICTLY socket B received the message; sockets A and C received NOTHING!
+    assert!(sockets[0].sent_messages.is_empty(), "Host A must receive 0 messages");
+    assert_eq!(sockets[1].sent_messages.len(), 1, "Host B must receive exactly 1 message");
+    assert!(sockets[2].sent_messages.is_empty(), "Host C must receive 0 messages");
+
+    let received_b: DropPayload = from_json_str(&sockets[1].sent_messages[0]).unwrap();
+    assert_eq!(received_b, payload_b);
+
+    // 2. Next joiner sends dead drop targeted at Host C's invite UUID
+    let uuid_c = "uuid-for-host-c";
+    let token_c = compute_invite_token(&secret_c, uuid_c).unwrap().hmac_hex;
+    let payload_c = sample_drop_payload(uuid_c, &token_c);
+    let bytes_c = to_json_bytes(&payload_c).unwrap();
+
+    let res_c = process_dead_drop(uuid_c, None, &bytes_c, &mut room_state, &mut sockets).unwrap();
+    assert_eq!(res_c.status, 200);
+
+    assert!(sockets[0].sent_messages.is_empty(), "Host A still has 0 messages");
+    assert_eq!(sockets[1].sent_messages.len(), 1, "Host B still has 1 message");
+    assert_eq!(sockets[2].sent_messages.len(), 1, "Host C received its message");
+
+    let received_c: DropPayload = from_json_str(&sockets[2].sent_messages[0]).unwrap();
+    assert_eq!(received_c, payload_c);
+
+    // 3. Foreign token not matching ANY host -> 403 Forbidden; none of the sockets receive messages
+    let foreign_secret = [0xEEu8; 32];
+    let uuid_x = "uuid-foreign";
+    let token_x = compute_invite_token(&foreign_secret, uuid_x).unwrap().hmac_hex;
+    let payload_x = sample_drop_payload(uuid_x, &token_x);
+    let bytes_x = to_json_bytes(&payload_x).unwrap();
+
+    let err_foreign = process_dead_drop(uuid_x, None, &bytes_x, &mut room_state, &mut sockets)
+        .expect_err("foreign token must fail");
+    assert_eq!(err_foreign, NetworkError::ForbiddenHmac);
+    assert_eq!(err_foreign.status_code(), 403);
+
+    assert_eq!(sockets[0].sent_messages.len(), 0);
+    assert_eq!(sockets[1].sent_messages.len(), 1);
+    assert_eq!(sockets[2].sent_messages.len(), 1);
+}
+
+#[test]
+fn test_stage_and_match_wire_json_serialization() {
+    let invite = sample_invite_payload("room-test", "uuid-test", "tok-123", [0x77; 32]);
+
+    // StageInviteRequest
+    let req = StageInviteRequest {
+        invite: invite.clone(),
+    };
+    let req_json = to_json_string(&req).unwrap();
+    let req_decoded: StageInviteRequest = from_json_str(&req_json).unwrap();
+    assert_eq!(req, req_decoded);
+
+    // MatchResponse::Matched
+    let res_matched = MatchResponse::Matched {
+        invite: invite.clone(),
+    };
+    let matched_json = to_json_string(&res_matched).unwrap();
+    assert!(matched_json.contains(r#""status":"matched""#));
+    let matched_decoded: MatchResponse = from_json_str(&matched_json).unwrap();
+    assert_eq!(res_matched, matched_decoded);
+
+    // MatchResponse::Empty
+    let res_empty = MatchResponse::Empty;
+    let empty_json = to_json_string(&res_empty).unwrap();
+    assert_eq!(empty_json, r#"{"status":"empty"}"#);
+    let empty_decoded: MatchResponse = from_json_str(&empty_json).unwrap();
+    assert_eq!(res_empty, empty_decoded);
 }

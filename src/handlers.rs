@@ -6,9 +6,10 @@ use std::fmt;
 
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use worker::{Headers, Request, RequestInit, Response, Result, State, WebSocketPair};
 use zero_protocol::crypto::verify_invite_token;
-use zero_protocol::{from_json_bytes, to_json_string, DropPayload};
+use zero_protocol::{from_json_bytes, to_json_string, DropPayload, InvitePayload};
 
 use crate::durable_object::{
     EphemeralRoomState, HibernatingSocket, HostAttachment, HOST_WEBSOCKET_TAG,
@@ -16,6 +17,20 @@ use crate::durable_object::{
 
 /// Maximum permitted HTTP body size (64 KiB) for `POST /drop/:do_id/:invite_uuid`.
 pub const MAX_DROP_BODY_BYTES: usize = 65_536;
+
+/// Payload accepted by `POST /stage/:do_id` or sent over active host WebSocket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageInviteRequest {
+    pub invite: InvitePayload,
+}
+
+/// Response returned by `GET /match/:do_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MatchResponse {
+    Matched { invite: InvitePayload },
+    Empty,
+}
 
 /// Target-independent HTTP response representation returned by protocol handlers.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,7 +173,7 @@ pub fn process_host_upgrade<S: HibernatingSocket>(
     let host_secret = parse_host_secret(raw_secret)?;
 
     socket
-        .attach_host_secret(&HostAttachment { host_secret })
+        .attach_host_secret(&HostAttachment::new(host_secret))
         .map_err(NetworkError::SocketError)?;
 
     Ok(HttpResponse {
@@ -167,12 +182,106 @@ pub fn process_host_upgrade<S: HibernatingSocket>(
     })
 }
 
+/// Validates caller host secret and stages an unburned `InvitePayload` on the matching host socket.
+pub fn process_stage_invite<S: HibernatingSocket>(
+    secret_str: Option<&str>,
+    body_bytes: &[u8],
+    room_state: &EphemeralRoomState,
+    host_sockets: &mut [S],
+) -> std::result::Result<HttpResponse, NetworkError> {
+    let raw_secret = secret_str.ok_or(NetworkError::InvalidHostSecret)?;
+    let host_secret = parse_host_secret(raw_secret)?;
+
+    let mut matched_idx: Option<usize> = None;
+    for (idx, sock) in host_sockets.iter().enumerate() {
+        if let Ok(Some(att)) = sock.recover_host_secret() {
+            if att.host_secret == host_secret {
+                matched_idx = Some(idx);
+                break;
+            }
+        }
+    }
+
+    let target_idx = matched_idx.ok_or(NetworkError::HostSocketUnavailable)?;
+
+    let invite: InvitePayload = if let Ok(req) = from_json_bytes::<StageInviteRequest>(body_bytes) {
+        req.invite
+    } else {
+        from_json_bytes::<InvitePayload>(body_bytes)
+            .map_err(|e| NetworkError::InvalidDropPayload(e.to_string()))?
+    };
+
+    verify_invite_token(&host_secret, &invite.invite_uuid, &invite.token)
+        .map_err(|_| NetworkError::ForbiddenHmac)?;
+
+    if room_state.is_burned(&invite.invite_uuid) {
+        return Err(NetworkError::InviteAlreadyBurned);
+    }
+
+    let attachment = HostAttachment {
+        host_secret,
+        staged_invite: Some(invite),
+    };
+    host_sockets[target_idx]
+        .attach_host_secret(&attachment)
+        .map_err(NetworkError::SocketError)?;
+
+    Ok(HttpResponse {
+        status: 200,
+        body: r#"{"status":"ok"}"#.to_string(),
+    })
+}
+
+/// Inspects active host sockets, selects one with an unburned staged invite via `selector_seed`,
+/// atomically consumes (clears) the staged invite on that socket, and returns `MatchResponse`.
+pub fn process_match_request<S: HibernatingSocket>(
+    room_state: &EphemeralRoomState,
+    host_sockets: &mut [S],
+    selector_seed: usize,
+) -> std::result::Result<HttpResponse, NetworkError> {
+    let mut available: Vec<(usize, HostAttachment, InvitePayload)> = Vec::new();
+    for (idx, sock) in host_sockets.iter().enumerate() {
+        if let Ok(Some(att)) = sock.recover_host_secret() {
+            if let Some(ref inv) = att.staged_invite {
+                if !room_state.is_burned(&inv.invite_uuid) {
+                    available.push((idx, att.clone(), inv.clone()));
+                }
+            }
+        }
+    }
+
+    if available.is_empty() {
+        let resp = MatchResponse::Empty;
+        let body = to_json_string(&resp).map_err(|e| NetworkError::SocketError(e.to_string()))?;
+        return Ok(HttpResponse {
+            status: 200,
+            body,
+        });
+    }
+
+    let selected_idx = selector_seed % available.len();
+    let (sock_idx, mut attachment, invite) = available.remove(selected_idx);
+
+    // Atomically clear staged_invite on that socket's attachment
+    attachment.staged_invite = None;
+    host_sockets[sock_idx]
+        .attach_host_secret(&attachment)
+        .map_err(NetworkError::SocketError)?;
+
+    let resp = MatchResponse::Matched { invite };
+    let body = to_json_string(&resp).map_err(|e| NetworkError::SocketError(e.to_string()))?;
+    Ok(HttpResponse {
+        status: 200,
+        body,
+    })
+}
+
 /// Processes a joiner's dead-drop `POST /drop/:do_id/:invite_uuid`:
 /// 1. Validates payload size, JSON structure, and `invite_uuid` consistency.
-/// 2. Recovers `HostAttachment` from the hibernating host WebSocket.
-/// 3. Verifies the HMAC-SHA256 invite token in constant time (returning `403 Forbidden` on failure).
+/// 2. Iterates host sockets to locate the specific socket whose `host_secret` matches the invite HMAC.
+/// 3. Verifies HMAC-SHA256 in constant time (returning `403 Forbidden` if no socket matches).
 /// 4. Checks and burns `invite_uuid` in `EphemeralRoomState` (returning `410 Gone` on replay).
-/// 5. Pipes the serialized `DropPayload` directly down the host's hibernating WebSocket.
+/// 5. Pipes the serialized `DropPayload` strictly to the matching host WebSocket.
 pub fn process_dead_drop<S: HibernatingSocket>(
     path_invite_uuid: &str,
     auth_header: Option<&str>,
@@ -213,22 +322,31 @@ pub fn process_dead_drop<S: HibernatingSocket>(
         }
     };
 
-    let mut recovered_attachment: Option<HostAttachment> = None;
-    for sock in host_sockets.iter() {
+    if host_sockets.is_empty() {
+        return Err(NetworkError::HostSocketUnavailable);
+    }
+
+    let mut found_any_attachment = false;
+    let mut matching_idx: Option<usize> = None;
+
+    for (idx, sock) in host_sockets.iter().enumerate() {
         if let Some(att) = sock
             .recover_host_secret()
             .map_err(NetworkError::SocketError)?
         {
-            recovered_attachment = Some(att);
-            break;
+            found_any_attachment = true;
+            if verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok() {
+                matching_idx = Some(idx);
+                break;
+            }
         }
     }
 
-    let attachment = recovered_attachment.ok_or(NetworkError::HostSocketUnavailable)?;
+    if !found_any_attachment {
+        return Err(NetworkError::HostSocketUnavailable);
+    }
 
-    // REQ-003.3: Constant-time HMAC verification BEFORE checking or mutating burn state.
-    verify_invite_token(&attachment.host_secret, path_invite_uuid, token)
-        .map_err(|_| NetworkError::ForbiddenHmac)?;
+    let target_idx = matching_idx.ok_or(NetworkError::ForbiddenHmac)?;
 
     // REQ-003.4: Replay detection & single-use invite burning in volatile memory.
     if room_state.is_burned(path_invite_uuid) {
@@ -238,20 +356,13 @@ pub fn process_dead_drop<S: HibernatingSocket>(
         return Err(NetworkError::BurnCapacityExceeded);
     }
 
-    // REQ-003.5: Pipe serialized DropPayload down the hibernating host WebSocket(s).
+    // Pipe serialized DropPayload strictly to that matching host socket.
     let serialized =
         to_json_string(&payload).map_err(|e| NetworkError::InvalidDropPayload(e.to_string()))?;
 
-    for sock in host_sockets.iter_mut() {
-        if sock
-            .recover_host_secret()
-            .map_err(NetworkError::SocketError)?
-            .is_some()
-        {
-            sock.send_text(&serialized)
-                .map_err(NetworkError::SocketError)?;
-        }
-    }
+    host_sockets[target_idx]
+        .send_text(&serialized)
+        .map_err(NetworkError::SocketError)?;
 
     Ok(HttpResponse {
         status: 200,
@@ -505,5 +616,85 @@ pub async fn handle_do_dead_drop(
     match result {
         Ok(_) => Response::from_json(&serde_json::json!({ "status": "ok" })),
         Err(err) => Response::error(err.to_string(), err.status_code()),
+    }
+}
+
+/// Cloudflare Durable Object adapter for `POST /stage/:do_id`.
+pub async fn handle_do_stage_invite(
+    req: &mut Request,
+    state: &State,
+    ephemeral: &RefCell<EphemeralRoomState>,
+) -> Result<Response> {
+    let mut secret = req.headers().get("X-Host-Secret")?;
+    if secret.is_none() {
+        secret = req.headers().get("Authorization")?;
+    }
+    if secret.is_none() {
+        if let Ok(url) = req.url() {
+            for (k, v) in url.query_pairs() {
+                if k == "secret" || k == "host_secret" {
+                    secret = Some(v.into_owned());
+                    break;
+                }
+            }
+        }
+    }
+
+    let body_bytes = req.bytes().await?;
+    let mut sockets = state.get_websockets_with_tag(HOST_WEBSOCKET_TAG);
+    if sockets.is_empty() {
+        sockets = state.get_websockets();
+    }
+
+    let result = {
+        let room_state = ephemeral.borrow();
+        process_stage_invite(secret.as_deref(), &body_bytes, &room_state, &mut sockets)
+    };
+
+    match result {
+        Ok(_) => Response::from_json(&serde_json::json!({ "status": "ok" })),
+        Err(err) => Response::error(err.to_string(), err.status_code()),
+    }
+}
+
+/// Cloudflare Durable Object adapter for `GET /match/:do_id`.
+pub async fn handle_do_match(
+    state: &State,
+    ephemeral: &RefCell<EphemeralRoomState>,
+) -> Result<Response> {
+    let mut sockets = state.get_websockets_with_tag(HOST_WEBSOCKET_TAG);
+    if sockets.is_empty() {
+        sockets = state.get_websockets();
+    }
+
+    let seed = generate_selector_seed();
+    let result = {
+        let room_state = ephemeral.borrow();
+        process_match_request(&room_state, &mut sockets, seed)
+    };
+
+    match result {
+        Ok(http_res) => {
+            let mut resp = Response::ok(&http_res.body)?;
+            resp.headers_mut().set("Content-Type", "application/json")?;
+            Ok(resp)
+        }
+        Err(err) => Response::error(err.to_string(), err.status_code()),
+    }
+}
+
+/// Generates a pseudo-random selector seed for round-robin / randomized host selection.
+pub fn generate_selector_seed() -> usize {
+    #[cfg(target_arch = "wasm32")]
+    {
+        (worker::js_sys::Math::random() * 1_000_000.0) as usize
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| (d.as_nanos() & 0xFFFF_FFFF) as usize)
+            .unwrap_or(0)
     }
 }

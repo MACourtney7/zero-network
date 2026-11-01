@@ -8,9 +8,12 @@ use worker::{
     durable_object, wasm_bindgen, DurableObject, Env, Error, Method, Request, Response, Result,
     State, WebSocket, WebSocketIncomingMessage,
 };
+use zero_protocol::crypto::verify_invite_token;
+use zero_protocol::InvitePayload;
 
 use crate::handlers::{
-    cors_preflight_response, handle_do_dead_drop, handle_do_host_upgrade, with_cors,
+    cors_preflight_response, handle_do_dead_drop, handle_do_host_upgrade, handle_do_match,
+    handle_do_stage_invite, with_cors, StageInviteRequest,
 };
 
 /// Cloudflare Worker environment binding name for the signaling Durable Object namespace.
@@ -24,10 +27,28 @@ pub const MAX_BURNED_UUIDS: usize = 4096;
 
 /// Serializable attachment saved to the hibernating host WebSocket via `serialize_attachment()`.
 /// Allows the Durable Object to sleep with 0 duration billing and recover the 32-byte `host_secret`
-/// in ~3ms when a joiner POSTs to `/drop/:do_id/:invite_uuid`.
+/// in ~3ms when a joiner POSTs to `/drop/:do_id/:invite_uuid`, or serve staged invites for dead-drop matchmaking.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostAttachment {
     pub host_secret: [u8; 32],
+    #[serde(default)]
+    pub staged_invite: Option<InvitePayload>,
+}
+
+impl HostAttachment {
+    pub fn new(host_secret: [u8; 32]) -> Self {
+        Self {
+            host_secret,
+            staged_invite: None,
+        }
+    }
+
+    pub fn with_staged_invite(host_secret: [u8; 32], staged_invite: InvitePayload) -> Self {
+        Self {
+            host_secret,
+            staged_invite: Some(staged_invite),
+        }
+    }
 }
 
 /// Target-independent abstraction over a hibernating WebSocket supporting attachment serialization
@@ -167,6 +188,14 @@ impl DurableObject for DeadDropRoom {
 
         match (req.method(), segments.as_slice()) {
             (Method::Get, ["host", _do_id]) => handle_do_host_upgrade(&req, &self.state),
+            (Method::Post, ["stage", _do_id]) => {
+                let resp = handle_do_stage_invite(&mut req, &self.state, &self.ephemeral).await?;
+                with_cors(resp)
+            }
+            (Method::Get, ["match", _do_id]) => {
+                let resp = handle_do_match(&self.state, &self.ephemeral).await?;
+                with_cors(resp)
+            }
             (Method::Post, ["drop", _do_id, invite_uuid]) => {
                 let resp = handle_do_dead_drop(&mut req, &self.state, &self.ephemeral, invite_uuid)
                     .await?;
@@ -178,11 +207,33 @@ impl DurableObject for DeadDropRoom {
 
     async fn websocket_message(
         &self,
-        _ws: WebSocket,
-        _message: WebSocketIncomingMessage,
+        ws: WebSocket,
+        message: WebSocketIncomingMessage,
     ) -> Result<()> {
-        // Host signaling socket is strictly receive-only for dead-drop SDP answers;
-        // ignore any keepalive frames and return immediately to hibernation.
+        let text_opt = match message {
+            WebSocketIncomingMessage::String(text) => Some(text),
+            WebSocketIncomingMessage::Binary(bytes) => String::from_utf8(bytes).ok(),
+        };
+
+        if let Some(text) = text_opt {
+            let invite_opt = serde_json::from_str::<StageInviteRequest>(&text)
+                .map(|r| r.invite)
+                .or_else(|_| serde_json::from_str::<InvitePayload>(&text))
+                .ok();
+
+            if let Some(invite) = invite_opt {
+                if let Ok(Some(mut attachment)) = ws.deserialize_attachment::<HostAttachment>() {
+                    let room_state = self.ephemeral.borrow();
+                    if verify_invite_token(&attachment.host_secret, &invite.invite_uuid, &invite.token).is_ok()
+                        && !room_state.is_burned(&invite.invite_uuid)
+                    {
+                        attachment.staged_invite = Some(invite);
+                        let _ = ws.serialize_attachment(&attachment);
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -239,9 +290,7 @@ mod tests {
         assert!(!socket.hibernating);
         assert_eq!(socket.recover_host_secret().unwrap(), None);
 
-        let attachment = HostAttachment {
-            host_secret: [0x55u8; 32],
-        };
+        let attachment = HostAttachment::new([0x55u8; 32]);
         socket.attach_host_secret(&attachment).unwrap();
         assert!(socket.hibernating);
         assert_eq!(
@@ -255,5 +304,12 @@ mod tests {
         let json = serde_json::to_string(&attachment).unwrap();
         let recovered: HostAttachment = serde_json::from_str(&json).unwrap();
         assert_eq!(recovered, attachment);
+        assert_eq!(recovered.staged_invite, None);
+
+        // Verify backward compatibility: legacy serialized HostAttachment without staged_invite field
+        let legacy_json = r#"{"host_secret":[85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85,85]}"#;
+        let legacy_recovered: HostAttachment = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy_recovered.host_secret, [0x55u8; 32]);
+        assert_eq!(legacy_recovered.staged_invite, None);
     }
 }
