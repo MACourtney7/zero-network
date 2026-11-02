@@ -32,11 +32,57 @@ pub enum MatchResponse {
     Empty,
 }
 
+pub const CORS_ALLOW_ORIGIN: &str = "*";
+pub const CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
+pub const CORS_ALLOW_HEADERS: &str = "Content-Type, Authorization, X-Host-Secret";
+pub const CORS_MAX_AGE: &str = "86400";
+
+/// Returns standard CORS headers as key-value pairs.
+pub fn cors_headers_vec() -> Vec<(String, String)> {
+    vec![
+        ("Access-Control-Allow-Origin".to_string(), CORS_ALLOW_ORIGIN.to_string()),
+        ("Access-Control-Allow-Methods".to_string(), CORS_ALLOW_METHODS.to_string()),
+        ("Access-Control-Allow-Headers".to_string(), CORS_ALLOW_HEADERS.to_string()),
+        ("Access-Control-Max-Age".to_string(), CORS_MAX_AGE.to_string()),
+    ]
+}
+
 /// Target-independent HTTP response representation returned by protocol handlers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpResponse {
     pub status: u16,
     pub body: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl HttpResponse {
+    pub fn new(status: u16, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: body.into(),
+            headers: Vec::new(),
+        }
+    }
+
+    pub fn with_cors(mut self) -> Self {
+        self.headers = cors_headers_vec();
+        self
+    }
+
+    pub fn cors_preflight() -> Self {
+        Self {
+            status: 204,
+            body: String::new(),
+            headers: cors_headers_vec(),
+        }
+    }
+
+    pub fn get_header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// Signaling protocol errors mapped deterministically to HTTP status codes.
@@ -44,6 +90,7 @@ pub struct HttpResponse {
 pub enum NetworkError {
     MissingUpgradeHeader,
     InvalidHostSecret,
+    Unauthorized,
     HostSocketUnavailable,
     InvalidDropPayload(String),
     InviteUuidMismatch,
@@ -60,6 +107,7 @@ impl NetworkError {
         match self {
             Self::MissingUpgradeHeader => 426,
             Self::InvalidHostSecret => 400,
+            Self::Unauthorized => 401,
             Self::HostSocketUnavailable => 404,
             Self::InvalidDropPayload(_) => 400,
             Self::InviteUuidMismatch => 400,
@@ -82,6 +130,7 @@ impl fmt::Display for NetworkError {
                     "Invalid or missing 32-byte host_secret (expected hex or base64)"
                 )
             }
+            Self::Unauthorized => write!(f, "401 Unauthorized: Invalid or missing host secret"),
             Self::HostSocketUnavailable => {
                 write!(f, "No active hibernating host WebSocket for room")
             }
@@ -179,6 +228,7 @@ pub fn process_host_upgrade<S: HibernatingSocket>(
     Ok(HttpResponse {
         status: 101,
         body: String::new(),
+        headers: Vec::new(),
     })
 }
 
@@ -229,6 +279,7 @@ pub fn process_stage_invite<S: HibernatingSocket>(
     Ok(HttpResponse {
         status: 200,
         body: r#"{"status":"ok"}"#.to_string(),
+        headers: cors_headers_vec(),
     })
 }
 
@@ -253,7 +304,11 @@ pub fn process_match_request<S: HibernatingSocket>(
     if available.is_empty() {
         let resp = MatchResponse::Empty;
         let body = to_json_string(&resp).map_err(|e| NetworkError::SocketError(e.to_string()))?;
-        return Ok(HttpResponse { status: 200, body });
+        return Ok(HttpResponse {
+            status: 200,
+            body,
+            headers: cors_headers_vec(),
+        });
     }
 
     let selected_idx = selector_seed % available.len();
@@ -267,7 +322,11 @@ pub fn process_match_request<S: HibernatingSocket>(
 
     let resp = MatchResponse::Matched { invite };
     let body = to_json_string(&resp).map_err(|e| NetworkError::SocketError(e.to_string()))?;
-    Ok(HttpResponse { status: 200, body })
+    Ok(HttpResponse {
+        status: 200,
+        body,
+        headers: cors_headers_vec(),
+    })
 }
 
 /// Processes a joiner's dead-drop `POST /drop/:do_id/:invite_uuid`:
@@ -361,6 +420,7 @@ pub fn process_dead_drop<S: HibernatingSocket>(
     Ok(HttpResponse {
         status: 200,
         body: r#"{"status":"ok"}"#.to_string(),
+        headers: cors_headers_vec(),
     })
 }
 
@@ -447,12 +507,14 @@ pub fn process_ice_servers(custom_json: Option<&str>) -> HttpResponse {
             return HttpResponse {
                 status: 200,
                 body: serde_json::to_string(&val).unwrap_or_default(),
+                headers: cors_headers_vec(),
             };
         }
     }
     HttpResponse {
         status: 200,
         body: serde_json::to_string(&default_ice_servers_json()).unwrap_or_default(),
+        headers: cors_headers_vec(),
     }
 }
 
@@ -533,48 +595,51 @@ pub async fn handle_ice_config(env: &worker::Env) -> Result<Response> {
 
 /// Cloudflare Durable Object adapter for `GET /host/:do_id` WebSocket upgrade and hibernation registration.
 pub fn handle_do_host_upgrade(req: &Request, state: &State) -> Result<Response> {
-    let upgrade = req.headers().get("Upgrade")?;
-    let mut secret = req.headers().get("X-Host-Secret")?;
-    if secret.is_none() {
-        secret = req.headers().get("Authorization")?;
-    }
-    if secret.is_none() {
-        if let Ok(url) = req.url() {
-            for (k, v) in url.query_pairs() {
-                if k == "secret" || k == "host_secret" {
-                    secret = Some(v.into_owned());
-                    break;
-                }
+    handle_do_host_upgrade_with_secret(req, state, None)
+}
+
+/// Cloudflare Durable Object adapter for `GET /host/:do_id` with optional expected room secret validation.
+pub fn handle_do_host_upgrade_with_secret(
+    req: &Request,
+    state: &State,
+    expected_secret: Option<&[u8; 32]>,
+) -> Result<Response> {
+    // 1. Resolve expected room secret: either passed explicitly or recovered from existing host sockets.
+    let mut expected: Option<[u8; 32]> = expected_secret.copied();
+    if expected.is_none() {
+        for sock in state.get_websockets_with_tag(HOST_WEBSOCKET_TAG).iter() {
+            if let Ok(Some(att)) = sock.recover_host_secret() {
+                expected = Some(att.host_secret);
+                break;
             }
         }
     }
 
+    // 2. Extract and authenticate secret (from headers or ?secret=<hex> query param)
+    let secret = crate::auth::extract_secret_from_request(req);
+    let host_secret = match crate::auth::authenticate_host(secret.as_deref(), expected.as_ref()) {
+        Ok(s) => s,
+        Err(err) => {
+            return with_cors(Response::error(err.to_string(), err.status_code())?);
+        }
+    };
+
+    // 3. Validate Upgrade: websocket header
+    let upgrade = req.headers().get("Upgrade")?;
     match upgrade.as_deref() {
         Some(val) if val.trim().eq_ignore_ascii_case("websocket") => {}
         _ => {
             let err = NetworkError::MissingUpgradeHeader;
-            return Response::error(err.to_string(), err.status_code());
+            return with_cors(Response::error(err.to_string(), err.status_code())?);
         }
-    }
-
-    let raw_secret = match secret.as_deref() {
-        Some(s) => s,
-        None => {
-            let err = NetworkError::InvalidHostSecret;
-            return Response::error(err.to_string(), err.status_code());
-        }
-    };
-
-    if let Err(err) = parse_host_secret(raw_secret) {
-        return Response::error(err.to_string(), err.status_code());
     }
 
     let pair = WebSocketPair::new()?;
     let mut server = pair.server;
     let client = pair.client;
 
-    if let Err(err) = process_host_upgrade(upgrade.as_deref(), Some(raw_secret), &mut server) {
-        return Response::error(err.to_string(), err.status_code());
+    if let Err(err) = server.attach_host_secret(&HostAttachment::new(host_secret)) {
+        return with_cors(Response::error(err, 500)?);
     }
 
     state.accept_websocket_with_tags(&server, &[HOST_WEBSOCKET_TAG]);
@@ -608,8 +673,8 @@ pub async fn handle_do_dead_drop(
     };
 
     match result {
-        Ok(_) => Response::from_json(&serde_json::json!({ "status": "ok" })),
-        Err(err) => Response::error(err.to_string(), err.status_code()),
+        Ok(_) => with_cors(Response::from_json(&serde_json::json!({ "status": "ok" }))?),
+        Err(err) => with_cors(Response::error(err.to_string(), err.status_code())?),
     }
 }
 
@@ -619,21 +684,7 @@ pub async fn handle_do_stage_invite(
     state: &State,
     ephemeral: &RefCell<EphemeralRoomState>,
 ) -> Result<Response> {
-    let mut secret = req.headers().get("X-Host-Secret")?;
-    if secret.is_none() {
-        secret = req.headers().get("Authorization")?;
-    }
-    if secret.is_none() {
-        if let Ok(url) = req.url() {
-            for (k, v) in url.query_pairs() {
-                if k == "secret" || k == "host_secret" {
-                    secret = Some(v.into_owned());
-                    break;
-                }
-            }
-        }
-    }
-
+    let secret = crate::auth::extract_secret_from_request(req);
     let body_bytes = req.bytes().await?;
     let mut sockets = state.get_websockets_with_tag(HOST_WEBSOCKET_TAG);
     if sockets.is_empty() {
@@ -646,8 +697,8 @@ pub async fn handle_do_stage_invite(
     };
 
     match result {
-        Ok(_) => Response::from_json(&serde_json::json!({ "status": "ok" })),
-        Err(err) => Response::error(err.to_string(), err.status_code()),
+        Ok(_) => with_cors(Response::from_json(&serde_json::json!({ "status": "ok" }))?),
+        Err(err) => with_cors(Response::error(err.to_string(), err.status_code())?),
     }
 }
 
@@ -671,9 +722,9 @@ pub async fn handle_do_match(
         Ok(http_res) => {
             let mut resp = Response::ok(&http_res.body)?;
             resp.headers_mut().set("Content-Type", "application/json")?;
-            Ok(resp)
+            with_cors(resp)
         }
-        Err(err) => Response::error(err.to_string(), err.status_code()),
+        Err(err) => with_cors(Response::error(err.to_string(), err.status_code())?),
     }
 }
 

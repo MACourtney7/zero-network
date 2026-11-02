@@ -2,9 +2,11 @@
 
 pub use zero_protocol;
 
+pub mod auth;
 pub mod durable_object;
 pub mod handlers;
 
+pub use auth::*;
 pub use durable_object::{
     DeadDropRoom, EphemeralRoomState, HibernatingSocket, HostAttachment, MockHostSocket,
     DEAD_DROP_BINDING, HOST_WEBSOCKET_TAG, MAX_BURNED_UUIDS,
@@ -17,12 +19,16 @@ pub use handlers::{
     MatchResponse, NetworkError, StageInviteRequest, MAX_DROP_BODY_BYTES,
 };
 
-use worker::{event, Context, Env, Request, Response, Result, Router};
+use worker::{event, Context, Env, Method, Request, Response, Result, Router};
 
 /// Cloudflare Worker fetch entrypoint routing `/host/:do_id` and `/drop/:do_id/:invite_uuid`
 /// to the named `DeadDropRoom` Durable Object instance, and `/ice` for TURN/STUN negotiation.
 #[event(fetch)]
 pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+    if req.method() == Method::Options {
+        return cors_preflight_response();
+    }
+
     let router = Router::new();
 
     router
@@ -36,11 +42,21 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .get_async("/host/:do_id", |req, ctx| async move {
             let do_id = match ctx.param("do_id") {
                 Some(id) if !id.trim().is_empty() => id,
-                _ => return Response::error("Missing Durable Object ID", 400),
+                _ => return with_cors(Response::error("Missing Durable Object ID", 400)?),
             };
             let namespace = ctx.durable_object(DEAD_DROP_BINDING)?;
             let stub = namespace.id_from_name(do_id)?.get_stub()?;
-            stub.fetch_with_request(req).await
+            let resp = match stub.fetch_with_request(req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err_resp = Response::error(format!("Durable Object error: {e}"), 500)?;
+                    return with_cors(err_resp);
+                }
+            };
+            if resp.status_code() == 101 {
+                return Ok(resp);
+            }
+            with_cors(resp)
         })
         .post_async("/stage/:do_id", |req, ctx| async move {
             let do_id = match ctx.param("do_id") {

@@ -12,7 +12,7 @@ use zero_protocol::crypto::verify_invite_token;
 use zero_protocol::InvitePayload;
 
 use crate::handlers::{
-    cors_preflight_response, handle_do_dead_drop, handle_do_host_upgrade, handle_do_match,
+    cors_preflight_response, handle_do_dead_drop, handle_do_host_upgrade_with_secret, handle_do_match,
     handle_do_stage_invite, with_cors, StageInviteRequest,
 };
 
@@ -120,18 +120,35 @@ impl HibernatingSocket for MockHostSocket {
     }
 }
 
-/// Ephemeral in-memory tracker of burned single-use invite UUIDs.
+/// Ephemeral in-memory tracker of burned single-use invite UUIDs and room secret.
 /// Purged automatically when the Durable Object unloads from memory; never written to persistent storage.
 #[derive(Debug, Default, Clone)]
 pub struct EphemeralRoomState {
     burned_uuids: HashSet<String>,
+    room_secret: Option<[u8; 32]>,
 }
 
 impl EphemeralRoomState {
     pub fn new() -> Self {
         Self {
             burned_uuids: HashSet::new(),
+            room_secret: None,
         }
+    }
+
+    pub fn with_room_secret(room_secret: [u8; 32]) -> Self {
+        Self {
+            burned_uuids: HashSet::new(),
+            room_secret: Some(room_secret),
+        }
+    }
+
+    pub fn room_secret(&self) -> Option<&[u8; 32]> {
+        self.room_secret.as_ref()
+    }
+
+    pub fn set_room_secret(&mut self, secret: [u8; 32]) {
+        self.room_secret = Some(secret);
     }
 
     /// Returns `true` if `invite_uuid` has already been consumed.
@@ -187,7 +204,18 @@ impl DurableObject for DeadDropRoom {
             .unwrap_or_default();
 
         match (req.method(), segments.as_slice()) {
-            (Method::Get, ["host", _do_id]) => handle_do_host_upgrade(&req, &self.state),
+            (Method::Get, ["host", _do_id]) => {
+                let expected = self.ephemeral.borrow().room_secret().copied();
+                let resp = handle_do_host_upgrade_with_secret(&req, &self.state, expected.as_ref())?;
+                if resp.status_code() == 101 && expected.is_none() {
+                    if let Some(sec_str) = crate::auth::extract_secret_from_request(&req) {
+                        if let Ok(parsed) = crate::auth::authenticate_host(Some(&sec_str), None) {
+                            self.ephemeral.borrow_mut().set_room_secret(parsed);
+                        }
+                    }
+                }
+                with_cors(resp)
+            }
             (Method::Post, ["stage", _do_id]) => {
                 let resp = handle_do_stage_invite(&mut req, &self.state, &self.ephemeral).await?;
                 with_cors(resp)

@@ -4,11 +4,16 @@
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use zero_network::{
-    default_ice_servers_json, extract_bearer_token, parse_custom_ice_servers, parse_host_secret,
-    process_dead_drop, process_host_upgrade, process_ice_servers, process_match_request,
-    process_stage_invite, EphemeralRoomState, HibernatingSocket, HostAttachment, MatchResponse,
-    MockHostSocket, NetworkError, StageInviteRequest, MAX_BURNED_UUIDS, MAX_DROP_BODY_BYTES,
+    authenticate_host, constant_time_eq, default_ice_servers_json, extract_bearer_token,
+    extract_secret_from_params, parse_custom_ice_servers, parse_host_secret, parse_query_secret,
+    process_dead_drop, process_host_query_upgrade, process_host_upgrade,
+    process_host_upgrade_authenticated, process_ice_servers, process_match_request,
+    process_stage_invite, EphemeralRoomState, HibernatingSocket, HostAttachment, HttpResponse,
+    MatchResponse, MockHostSocket, NetworkError, StageInviteRequest, MAX_BURNED_UUIDS,
+    MAX_DROP_BODY_BYTES,
 };
+#[cfg(target_arch = "wasm32")]
+use zero_network::{build_default_stun_response, cors_preflight_response, with_cors};
 use zero_protocol::crypto::{compute_invite_token, X25519Keypair};
 use zero_protocol::{
     from_json_str, to_json_bytes, to_json_string, DropPayload, InvitePayload, SdpAnswer, SdpOffer,
@@ -833,4 +838,247 @@ fn test_stage_and_match_wire_json_serialization() {
     assert_eq!(empty_json, r#"{"status":"empty"}"#);
     let empty_decoded: MatchResponse = from_json_str(&empty_json).unwrap();
     assert_eq!(res_empty, empty_decoded);
+}
+
+#[test]
+fn test_host_query_secret_authentication() {
+    let valid_secret = [0x42u8; 32];
+    let valid_hex = hex::encode(valid_secret);
+
+    // Direct verification of parse_query_secret
+    assert_eq!(parse_query_secret("/host/room1?secret=aabbcc"), Some("aabbcc".to_string()));
+    assert_eq!(parse_query_secret("/host/room1?host_secret=ddeeff"), Some("ddeeff".to_string()));
+    assert_eq!(parse_query_secret("/host/room1?other=123"), None);
+
+    // Direct verification of authenticate_host
+    assert_eq!(authenticate_host(Some(&valid_hex), None).unwrap(), valid_secret);
+    assert_eq!(
+        authenticate_host(Some("not_a_valid_hex"), None).unwrap_err(),
+        NetworkError::Unauthorized
+    );
+
+    // 1. GET /host/:do_id?secret=<valid_hex> successfully authenticates
+    let mut socket_ok = MockHostSocket::new();
+    let url_valid = format!("/host/room-abc?secret={valid_hex}");
+    let res = process_host_query_upgrade(Some("websocket"), &url_valid, None, &mut socket_ok)
+        .expect("valid query secret upgrade should succeed");
+    assert_eq!(res.status, 101);
+    assert!(socket_ok.hibernating);
+    assert_eq!(
+        socket_ok.recover_host_secret().unwrap(),
+        Some(HostAttachment::new(valid_secret))
+    );
+
+    // Also verify with ?host_secret= alias
+    let mut socket_alias = MockHostSocket::new();
+    let url_alias = format!("/host/room-abc?host_secret={valid_hex}");
+    let res_alias = process_host_query_upgrade(Some("websocket"), &url_alias, None, &mut socket_alias)
+        .expect("valid host_secret alias upgrade should succeed");
+    assert_eq!(res_alias.status, 101);
+    assert!(socket_alias.hibernating);
+
+    // 2. GET /host/:do_id?secret=<invalid_hex> returns 401 Unauthorized
+    let mut socket_bad_hex = MockHostSocket::new();
+    let err_bad_hex = process_host_query_upgrade(
+        Some("websocket"),
+        "/host/room-abc?secret=not_a_valid_hex_string_12345",
+        None,
+        &mut socket_bad_hex,
+    )
+    .expect_err("invalid hex secret must fail");
+    assert_eq!(err_bad_hex, NetworkError::Unauthorized);
+    assert_eq!(err_bad_hex.status_code(), 401);
+    assert!(!socket_bad_hex.hibernating);
+
+    // Short hex secret (e.g. 8 chars instead of 64 chars) -> 401 Unauthorized
+    let mut socket_short_hex = MockHostSocket::new();
+    let err_short_hex = process_host_query_upgrade(
+        Some("websocket"),
+        "/host/room-abc?secret=deadbeef",
+        None,
+        &mut socket_short_hex,
+    )
+    .expect_err("short hex secret must fail");
+    assert_eq!(err_short_hex, NetworkError::Unauthorized);
+    assert_eq!(err_short_hex.status_code(), 401);
+
+    // Missing secret parameter completely -> 401 Unauthorized
+    let mut socket_missing = MockHostSocket::new();
+    let err_missing = process_host_query_upgrade(
+        Some("websocket"),
+        "/host/room-abc",
+        None,
+        &mut socket_missing,
+    )
+    .expect_err("missing query secret must fail");
+    assert_eq!(err_missing, NetworkError::Unauthorized);
+    assert_eq!(err_missing.status_code(), 401);
+
+    // 3. Constant-time comparison against expected room secret
+    let room_secret = [0x55u8; 32];
+    let other_secret = [0x99u8; 32];
+    let room_hex = hex::encode(room_secret);
+    let other_hex = hex::encode(other_secret);
+
+    // Matching room secret succeeds
+    let mut socket_room_match = MockHostSocket::new();
+    let res_room = process_host_query_upgrade(
+        Some("websocket"),
+        &format!("/host/room-abc?secret={room_hex}"),
+        Some(&room_secret),
+        &mut socket_room_match,
+    )
+    .expect("matching room secret should succeed");
+    assert_eq!(res_room.status, 101);
+
+    // Mismatched room secret returns 401 Unauthorized
+    let mut socket_mismatch = MockHostSocket::new();
+    let err_mismatch = process_host_query_upgrade(
+        Some("websocket"),
+        &format!("/host/room-abc?secret={other_hex}"),
+        Some(&room_secret),
+        &mut socket_mismatch,
+    )
+    .expect_err("mismatched room secret must return 401");
+    assert_eq!(err_mismatch, NetworkError::Unauthorized);
+    assert_eq!(err_mismatch.status_code(), 401);
+
+    // Verify constant_time_eq helper directly
+    assert!(constant_time_eq(&room_secret, &room_secret));
+    assert!(!constant_time_eq(&room_secret, &other_secret));
+    assert!(!constant_time_eq(&[1, 2, 3], &[1, 2]));
+
+    // 4. Header precedence over query parameter
+    let header_secret = [0x11u8; 32];
+    let header_hex = hex::encode(header_secret);
+    let query_hex = hex::encode(other_secret);
+
+    // X-Host-Secret takes precedence over ?secret
+    let extracted = extract_secret_from_params(Some(&header_hex), None, Some(&query_hex)).unwrap();
+    assert_eq!(extracted, header_hex);
+
+    // Authorization: Bearer takes precedence over ?secret
+    let auth_header = format!("Bearer {header_hex}");
+    let extracted_auth = extract_secret_from_params(None, Some(&auth_header), Some(&query_hex)).unwrap();
+    assert_eq!(extracted_auth, header_hex);
+
+    // Fallback to ?secret when headers absent
+    let extracted_query = extract_secret_from_params(None, None, Some(&query_hex)).unwrap();
+    assert_eq!(extracted_query, query_hex);
+
+    // process_host_upgrade_authenticated with query secret
+    let mut socket_auth = MockHostSocket::new();
+    let res_auth = process_host_upgrade_authenticated(
+        Some("websocket"),
+        None,
+        None,
+        Some(&valid_hex),
+        None,
+        &mut socket_auth,
+    )
+    .expect("authenticated upgrade with query secret should succeed");
+    assert_eq!(res_auth.status, 101);
+}
+
+#[test]
+fn test_universal_cors_headers_and_options_preflight() {
+    // 1. Target-independent preflight OPTIONS response returns 204 with universal CORS headers
+    let preflight = HttpResponse::cors_preflight();
+    assert_eq!(preflight.status, 204);
+    assert_eq!(
+        preflight.get_header("Access-Control-Allow-Origin"),
+        Some("*")
+    );
+    assert_eq!(
+        preflight.get_header("Access-Control-Allow-Methods"),
+        Some("GET, POST, OPTIONS")
+    );
+    assert_eq!(
+        preflight.get_header("Access-Control-Allow-Headers"),
+        Some("Content-Type, Authorization, X-Host-Secret")
+    );
+    assert_eq!(
+        preflight.get_header("Access-Control-Max-Age"),
+        Some("86400")
+    );
+
+    // 2. /ice endpoint responses have CORS headers attached
+    let ice_resp = process_ice_servers(None);
+    assert_eq!(ice_resp.status, 200);
+    assert_eq!(
+        ice_resp.get_header("Access-Control-Allow-Origin"),
+        Some("*")
+    );
+    assert_eq!(
+        ice_resp.get_header("Access-Control-Allow-Methods"),
+        Some("GET, POST, OPTIONS")
+    );
+    assert_eq!(
+        ice_resp.get_header("Access-Control-Allow-Headers"),
+        Some("Content-Type, Authorization, X-Host-Secret")
+    );
+
+    // 3. /match/:do_id standard response has CORS headers attached
+    let room_state = EphemeralRoomState::new();
+    let mut empty_sockets: Vec<MockHostSocket> = Vec::new();
+    let match_resp = process_match_request(&room_state, &mut empty_sockets, 0)
+        .expect("empty match request");
+    assert_eq!(match_resp.status, 200);
+    assert_eq!(
+        match_resp.get_header("Access-Control-Allow-Origin"),
+        Some("*")
+    );
+    assert_eq!(
+        match_resp.get_header("Access-Control-Allow-Methods"),
+        Some("GET, POST, OPTIONS")
+    );
+    assert_eq!(
+        match_resp.get_header("Access-Control-Allow-Headers"),
+        Some("Content-Type, Authorization, X-Host-Secret")
+    );
+
+    // 4. /stage/:do_id standard response has CORS headers attached
+    let host_secret = [0x77u8; 32];
+    let mut host_socket = MockHostSocket::new();
+    process_host_upgrade(
+        Some("websocket"),
+        Some(&hex::encode(host_secret)),
+        &mut host_socket,
+    )
+    .expect("host upgrade");
+    let mut host_sockets = vec![host_socket];
+    let invite_token = zero_protocol::crypto::compute_invite_token(&host_secret, "uuid-cors-stage")
+        .unwrap()
+        .hmac_hex;
+    let invite = sample_invite_payload("room-cors", "uuid-cors-stage", &invite_token, [0x88; 32]);
+    let stage_bytes = to_json_bytes(&StageInviteRequest { invite }).unwrap();
+    let stage_resp = process_stage_invite(
+        Some(&hex::encode(host_secret)),
+        &stage_bytes,
+        &room_state,
+        &mut host_sockets,
+    )
+    .expect("stage invite");
+    assert_eq!(stage_resp.status, 200);
+    assert_eq!(
+        stage_resp.get_header("Access-Control-Allow-Origin"),
+        Some("*")
+    );
+    assert_eq!(
+        stage_resp.get_header("Access-Control-Allow-Methods"),
+        Some("GET, POST, OPTIONS")
+    );
+    assert_eq!(
+        stage_resp.get_header("Access-Control-Allow-Headers"),
+        Some("Content-Type, Authorization, X-Host-Secret")
+    );
+
+    // 5. In Wasm runtime contexts, verify worker::Response wrappers directly
+    #[cfg(target_arch = "wasm32")]
+    {
+        let wasm_preflight = cors_preflight_response().expect("create cors preflight response");
+        assert_eq!(wasm_preflight.status_code(), 204);
+        let headers = wasm_preflight.headers();
+        assert_eq!(headers.get("Access-Control-Allow-Origin").unwrap(), Some("*".to_string()));
+    }
 }
