@@ -1,5 +1,13 @@
 # zero_network Codebase Dump
 
+## FILE: .gitignore
+```
+.DS_Store
+/target
+target/
+**/*.rs.bk
+```
+
 ## FILE: Cargo.toml
 ```toml
 [package]
@@ -18,7 +26,6 @@ serde_json = "1.0"
 url = "2.5"
 worker = "0.7"
 zero_protocol = { path = "../zero_protocol/crates/zero_protocol" }
-
 ```
 
 ## FILE: src/auth.rs
@@ -206,7 +213,6 @@ pub fn extract_secret_from_request(req: &worker::Request) -> Option<String> {
     }
     None
 }
-
 ```
 
 ## FILE: src/durable_object.rs
@@ -559,7 +565,6 @@ mod tests {
         assert_eq!(legacy_recovered.staged_invite, None);
     }
 }
-
 ```
 
 ## FILE: src/handlers.rs
@@ -1309,7 +1314,6 @@ pub fn generate_selector_seed() -> usize {
             .unwrap_or(0)
     }
 }
-
 ```
 
 ## FILE: src/lib.rs
@@ -1476,7 +1480,6 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .run(req, env)
         .await
 }
-
 ```
 
 ## FILE: tests/network_tests.rs
@@ -2565,7 +2568,6 @@ fn test_universal_cors_headers_and_options_preflight() {
         assert_eq!(headers.get("Access-Control-Allow-Origin").unwrap(), Some("*".to_string()));
     }
 }
-
 ```
 
 ## FILE: wrangler.toml
@@ -2603,6 +2605,5 @@ class_name = "DeadDropRoom"
 # Set via: wrangler secret put CF_TURN_KEY_ID
 # Set via: wrangler secret put CF_TURN_API_TOKEN
 # Optional fallback override: TURN_SERVERS_JSON
-
 ```
 
