@@ -299,9 +299,16 @@ pub fn process_stage_invite<S: HibernatingSocket>(
         return Err(NetworkError::InviteAlreadyBurned);
     }
 
+    // Preserve the socket's existing host_peer_id when re-attaching the staged invite.
+    let existing_peer_id = host_sockets[target_idx]
+        .recover_host_secret()
+        .ok()
+        .flatten()
+        .and_then(|att| att.host_peer_id);
     let attachment = HostAttachment {
         host_secret,
         staged_invite: Some(invite),
+        host_peer_id: existing_peer_id,
     };
     host_sockets[target_idx]
         .attach_host_secret(&attachment)
@@ -669,7 +676,17 @@ pub fn handle_do_host_upgrade_with_secret(
     let mut server = pair.server;
     let client = pair.client;
 
-    if let Err(err) = server.attach_host_secret(&HostAttachment::new(host_secret)) {
+    // Record the owning host peer id (if provided) so staged invites can be
+    // filtered to the active host during `/match`.
+    let mut attachment = HostAttachment::new(host_secret);
+    if let Ok(Some(peer_id)) = req.headers().get("X-Peer-Id") {
+        let trimmed = peer_id.trim();
+        if !trimmed.is_empty() {
+            attachment = attachment.with_host_peer_id(trimmed);
+        }
+    }
+
+    if let Err(err) = server.attach_host_secret(&attachment) {
         return with_cors(Response::error(err, 500)?);
     }
 
@@ -869,6 +886,16 @@ pub fn reserve_staged_invite_for_peer<S: HibernatingSocket>(
 
     for sock in host_sockets.iter() {
         if let Ok(Some(att)) = sock.recover_host_secret() {
+            // Only serve invites staged by the currently-elected active host.
+            // Sockets belonging to stale/dead hosts are ignored.
+            let owner_matches = att
+                .host_peer_id
+                .as_deref()
+                .map(|owner| owner == active_host_peer_id)
+                .unwrap_or(false);
+            if !owner_matches {
+                continue;
+            }
             if let Some(ref inv) = att.staged_invite {
                 if room_state.is_burned(&inv.invite_uuid) || room_state.is_reserved(&inv.invite_uuid)
                 {
@@ -907,6 +934,40 @@ impl HostElectionState {
             _ => false,
         }
     }
+
+    /// Restores host election state from DO storage on cold start.
+    ///
+    /// Reads `host_peer_id`, `host_claimed_at`, and `room_secret` from persistent
+    /// storage. Missing or malformed values are ignored (leaving the field `None`),
+    /// which safely falls back to lazy re-election on the next `/match`.
+    pub async fn restore_from_storage(&mut self, state: &State) -> Result<()> {
+        let storage = state.storage();
+
+        if let Ok(Some(peer_id)) = storage.get::<String>(HOST_PEER_ID_STORAGE_KEY).await {
+            let trimmed = peer_id.trim();
+            if !trimmed.is_empty() {
+                self.host_peer_id = Some(trimmed.to_string());
+            }
+        }
+
+        if let Ok(Some(claimed_at)) = storage.get::<f64>(HOST_CLAIMED_AT_STORAGE_KEY).await {
+            if claimed_at.is_finite() && claimed_at > 0.0 {
+                self.host_claimed_at = Some(claimed_at);
+            }
+        }
+
+        if let Ok(Some(hex_secret)) = storage.get::<String>(ROOM_SECRET_STORAGE_KEY).await {
+            if let Ok(bytes) = hex::decode(hex_secret.trim()) {
+                if bytes.len() == 32 {
+                    let mut secret = [0u8; 32];
+                    secret.copy_from_slice(&bytes);
+                    self.room_secret = Some(secret);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Cloudflare Durable Object adapter for `GET /match/:do_id`.
@@ -925,14 +986,15 @@ pub async fn handle_do_match(
     caller_peer_id: Option<&str>,
 ) -> Result<Response> {
     // M3: X-Peer-Id is strictly required.
-    let peer = match caller_peer_id.map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        Some(p) => p.to_string(),
-        None => {
+    let peer = match validate_peer_id(caller_peer_id) {
+        Ok(p) => p,
+        Err(_) => {
             return with_cors(Response::error("Missing or empty X-Peer-Id header", 400)?);
         }
     };
 
     // H2: Initialize the room secret exactly once, persist it, and cache it in memory.
+    // NOTE: `load_or_init_room_secret` awaits, so we must not hold any RefCell borrow here.
     let room_secret = match election.room_secret {
         Some(secret) => secret,
         None => {
@@ -941,7 +1003,10 @@ pub async fn handle_do_match(
             secret
         }
     };
-    ephemeral.borrow_mut().set_room_secret(room_secret);
+    // Borrow is scoped and dropped immediately after the synchronous set.
+    {
+        ephemeral.borrow_mut().set_room_secret(room_secret);
+    }
     let room_secret_hex = hex::encode(room_secret);
 
     let storage = state.storage();
@@ -983,6 +1048,7 @@ pub async fn handle_do_match(
     if sockets.is_empty() {
         sockets = state.get_websockets();
     }
+    // Scope the RefCell borrow so it is dropped before any subsequent await.
     let reserved_invite = {
         let mut room_state = ephemeral.borrow_mut();
         reserve_staged_invite_for_peer(&mut room_state, &sockets, &active_host, &peer)
@@ -1011,6 +1077,18 @@ pub async fn handle_do_match(
     let mut resp = Response::ok(serde_json::to_string(&body).unwrap_or_default())?;
     resp.headers_mut().set("Content-Type", "application/json")?;
     with_cors(resp)
+}
+
+/// Validates and normalizes the caller's `X-Peer-Id` header value.
+///
+/// Returns `Ok(peer_id)` when a non-empty trimmed peer id is present, or
+/// `Err(NetworkError::Unauthorized)` (mapped to HTTP 400 by the caller) when
+/// the header is missing or empty.
+pub fn validate_peer_id(caller_peer_id: Option<&str>) -> std::result::Result<String, NetworkError> {
+    match caller_peer_id.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(p) => Ok(p.to_string()),
+        None => Err(NetworkError::Unauthorized),
+    }
 }
 
 /// Generates a pseudo-random selector seed for round-robin / randomized host selection.

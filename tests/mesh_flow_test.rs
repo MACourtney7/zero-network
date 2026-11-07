@@ -4,7 +4,8 @@ use std::cell::RefCell;
 
 use zero_network::durable_object::{EphemeralRoomState, HibernatingSocket, HostAttachment, MockHostSocket};
 use zero_network::handlers::{
-    generate_room_secret, reserve_staged_invite, HOST_TTL_MS,
+    generate_room_secret, reserve_staged_invite, reserve_staged_invite_for_peer, validate_peer_id,
+    HOST_TTL_MS,
 };
 use zero_protocol::InvitePayload;
 
@@ -106,4 +107,83 @@ fn test_refcell_ephemeral_state_supports_reservation() {
         assert!(state.reserve_uuid("uuid-a".to_string()));
     }
     assert!(ephemeral.borrow().is_reserved("uuid-a"));
+}
+
+#[test]
+fn test_reserve_staged_invite_for_peer_rejects_non_active_host() {
+    // Two host sockets: one owned by the active host, one by a stale host.
+    let active_secret = [0x10u8; 32];
+    let stale_secret = [0x20u8; 32];
+
+    let mut active_socket = MockHostSocket::new();
+    active_socket
+        .attach_host_secret(
+            &HostAttachment::with_staged_invite(
+                active_secret,
+                sample_invite("invite-active", "tok-active"),
+            )
+            .with_host_peer_id("host-active"),
+        )
+        .unwrap();
+
+    let mut stale_socket = MockHostSocket::new();
+    stale_socket
+        .attach_host_secret(
+            &HostAttachment::with_staged_invite(
+                stale_secret,
+                sample_invite("invite-stale", "tok-stale"),
+            )
+            .with_host_peer_id("host-stale"),
+        )
+        .unwrap();
+
+    let sockets = vec![stale_socket, active_socket];
+    let mut room_state = EphemeralRoomState::new();
+
+    // Only the active host's invite should be served.
+    let reserved =
+        reserve_staged_invite_for_peer(&mut room_state, &sockets, "host-active", "joiner-1");
+    assert!(reserved.is_some(), "active host invite should be reserved");
+    assert_eq!(reserved.unwrap().invite_uuid, "invite-active");
+
+    // A second joiner must not receive the stale host's invite.
+    let second =
+        reserve_staged_invite_for_peer(&mut room_state, &sockets, "host-active", "joiner-2");
+    assert!(
+        second.is_none(),
+        "stale host invites must not be served to joiners"
+    );
+}
+
+#[test]
+fn test_match_without_peer_id_is_rejected() {
+    // `/match` requires a non-empty X-Peer-Id header; missing/empty must be rejected
+    // (mapped to HTTP 400 by `handle_do_match`).
+    assert!(validate_peer_id(None).is_err());
+    assert!(validate_peer_id(Some("")).is_err());
+    assert!(validate_peer_id(Some("   ")).is_err());
+    assert_eq!(validate_peer_id(Some("peer-1")).unwrap(), "peer-1");
+    assert_eq!(validate_peer_id(Some("  peer-2  ")).unwrap(), "peer-2");
+}
+
+#[test]
+fn test_reserve_staged_invite_for_peer_ignores_sockets_without_peer_id() {
+    // A socket with no recorded host_peer_id must not be treated as the active host.
+    let mut socket = MockHostSocket::new();
+    socket
+        .attach_host_secret(&HostAttachment::with_staged_invite(
+            [0x30u8; 32],
+            sample_invite("invite-anon", "tok-anon"),
+        ))
+        .unwrap();
+
+    let sockets = vec![socket];
+    let mut room_state = EphemeralRoomState::new();
+
+    let reserved =
+        reserve_staged_invite_for_peer(&mut room_state, &sockets, "host-active", "joiner-1");
+    assert!(
+        reserved.is_none(),
+        "sockets without host_peer_id must not be served"
+    );
 }

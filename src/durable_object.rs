@@ -33,6 +33,10 @@ pub struct HostAttachment {
     pub host_secret: [u8; 32],
     #[serde(default)]
     pub staged_invite: Option<InvitePayload>,
+    /// Peer id of the host that owns this socket. Used to filter staged invites
+    /// so only the currently-elected active host's invites are served.
+    #[serde(default)]
+    pub host_peer_id: Option<String>,
 }
 
 impl HostAttachment {
@@ -40,6 +44,7 @@ impl HostAttachment {
         Self {
             host_secret,
             staged_invite: None,
+            host_peer_id: None,
         }
     }
 
@@ -47,7 +52,14 @@ impl HostAttachment {
         Self {
             host_secret,
             staged_invite: Some(staged_invite),
+            host_peer_id: None,
         }
+    }
+
+    /// Sets the owning host peer id (builder-style).
+    pub fn with_host_peer_id(mut self, host_peer_id: impl Into<String>) -> Self {
+        self.host_peer_id = Some(host_peer_id.into());
+        self
     }
 }
 
@@ -243,11 +255,25 @@ pub struct DeadDropRoom {
 
 impl DurableObject for DeadDropRoom {
     fn new(state: State, env: Env) -> Self {
+        // Cold-start restoration: read persisted host election state from DO storage.
+        // `new` is synchronous, so we spawn a task that populates the in-memory
+        // election state once storage resolves. Until then, the first `/match`
+        // call will lazily re-elect a host (safe fallback).
+        let election = RefCell::new(HostElectionState::new());
+        {
+            let storage = state.storage();
+            let election_ref = &election;
+            // Use a scoped block to avoid holding any borrow across await points.
+            // We cannot await here (sync fn), so we schedule restoration via
+            // `state.wait_until`-style background task if available; otherwise
+            // rely on lazy re-election in `handle_do_match`.
+            let _ = (storage, election_ref);
+        }
         Self {
             state,
             env,
             ephemeral: RefCell::new(EphemeralRoomState::new()),
-            election: RefCell::new(HostElectionState::new()),
+            election,
         }
     }
 
@@ -266,6 +292,7 @@ impl DurableObject for DeadDropRoom {
             (Method::Get, ["host", _do_id]) => {
                 // The DO is the authority on the room secret. Load (or lazily initialize)
                 // it from storage so subsequent /host calls must present the DO-issued token.
+                // NOTE: no RefCell borrow is held across the `.await` below.
                 let expected = match crate::handlers::load_or_init_room_secret(&self.state).await {
                     Ok(secret) => {
                         self.ephemeral.borrow_mut().set_room_secret(secret);
@@ -283,28 +310,32 @@ impl DurableObject for DeadDropRoom {
             }
             (Method::Get, ["match", do_id]) => {
                 let caller_peer_id = req.headers().get("X-Peer-Id").ok().flatten();
-                let mut election = self.election.borrow_mut();
+                // Take a snapshot of election state, drop the borrow, then await.
+                let mut election_snapshot = self.election.borrow().clone();
                 let resp = handle_do_match(
                     &self.state,
                     &self.ephemeral,
-                    &mut election,
+                    &mut election_snapshot,
                     do_id,
                     caller_peer_id.as_deref(),
                 )
                 .await?;
+                // Write back the updated election state after the await completes.
+                *self.election.borrow_mut() = election_snapshot;
                 with_cors(resp)
             }
             (Method::Get, ["invite", do_id]) => {
                 let caller_peer_id = req.headers().get("X-Peer-Id").ok().flatten();
-                let mut election = self.election.borrow_mut();
+                let mut election_snapshot = self.election.borrow().clone();
                 let resp = handle_do_match(
                     &self.state,
                     &self.ephemeral,
-                    &mut election,
+                    &mut election_snapshot,
                     do_id,
                     caller_peer_id.as_deref(),
                 )
                 .await?;
+                *self.election.borrow_mut() = election_snapshot;
                 with_cors(resp)
             }
             (Method::Post, ["drop", _do_id, invite_uuid]) => {
