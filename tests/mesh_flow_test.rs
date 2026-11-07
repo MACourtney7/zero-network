@@ -15,6 +15,9 @@ fn sample_invite(uuid: &str, token: &str) -> InvitePayload {
         token: token.to_string(),
         host_public_key: [0x11u8; 32],
         host_peer_id: None,
+        assigned_peer_id: None,
+        guest_private_key: None,
+        host_signing_key: None,
         sdp_offer: zero_protocol::SdpOffer {
             sdp: "v=0\r\n".to_string(),
         },
