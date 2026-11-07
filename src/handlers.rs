@@ -417,17 +417,17 @@ pub fn process_dead_drop<S: HibernatingSocket>(
     }
 
     let mut found_any_attachment = false;
-    let mut matching_idx: Option<usize> = None;
+    let mut staged_match_idx: Option<usize> = None;
+    let mut hmac_match_idx: Option<usize> = None;
 
+    // Pass 1: prefer a socket that staged this exact invite AND whose HMAC verifies.
+    // A matching staged UUID alone is not sufficient authorization.
     for (idx, sock) in host_sockets.iter().enumerate() {
         if let Some(att) = sock
             .recover_host_secret()
             .map_err(NetworkError::SocketError)?
         {
             found_any_attachment = true;
-            // Route the drop to the exact host socket that staged this invite, but
-            // NEVER accept a staged-invite match without verifying the HMAC token.
-            // A matching staged UUID alone is not sufficient authorization.
             let staged_matches = att
                 .staged_invite
                 .as_ref()
@@ -436,8 +436,25 @@ pub fn process_dead_drop<S: HibernatingSocket>(
             if staged_matches
                 && verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok()
             {
-                matching_idx = Some(idx);
+                staged_match_idx = Some(idx);
                 break;
+            }
+        }
+    }
+
+    // Pass 2: fall back to any socket whose HMAC verifies. This preserves
+    // backward compatibility with sockets that have no staged invite (e.g.
+    // direct host connections and unit tests).
+    if staged_match_idx.is_none() {
+        for (idx, sock) in host_sockets.iter().enumerate() {
+            if let Some(att) = sock
+                .recover_host_secret()
+                .map_err(NetworkError::SocketError)?
+            {
+                if verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok() {
+                    hmac_match_idx = Some(idx);
+                    break;
+                }
             }
         }
     }
@@ -446,7 +463,9 @@ pub fn process_dead_drop<S: HibernatingSocket>(
         return Err(NetworkError::HostSocketUnavailable);
     }
 
-    let target_idx = matching_idx.ok_or(NetworkError::ForbiddenHmac)?;
+    let target_idx = staged_match_idx
+        .or(hmac_match_idx)
+        .ok_or(NetworkError::ForbiddenHmac)?;
 
     // REQ-003.4: Replay detection & single-use invite burning in volatile memory.
     if room_state.is_burned(path_invite_uuid) {
