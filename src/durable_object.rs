@@ -1,7 +1,7 @@
 //! Cloudflare Durable Object with WebSocket Hibernation and ephemeral in-memory invite burn state.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use worker::{
@@ -13,7 +13,7 @@ use zero_protocol::InvitePayload;
 
 use crate::handlers::{
     cors_preflight_response, handle_do_dead_drop, handle_do_host_upgrade_with_secret, handle_do_match,
-    handle_do_stage_invite, with_cors, StageInviteRequest,
+    handle_do_stage_invite, with_cors, HostElectionState, StageInviteRequest,
 };
 
 /// Cloudflare Worker environment binding name for the signaling Durable Object namespace.
@@ -126,6 +126,8 @@ impl HibernatingSocket for MockHostSocket {
 pub struct EphemeralRoomState {
     burned_uuids: HashSet<String>,
     reserved_uuids: HashSet<String>,
+    /// Maps joiner `peer_id` -> reserved `InvitePayload` for idempotent reservation.
+    reserved_by_peer: HashMap<String, InvitePayload>,
     room_secret: Option<[u8; 32]>,
 }
 
@@ -134,6 +136,7 @@ impl EphemeralRoomState {
         Self {
             burned_uuids: HashSet::new(),
             reserved_uuids: HashSet::new(),
+            reserved_by_peer: HashMap::new(),
             room_secret: None,
         }
     }
@@ -142,6 +145,7 @@ impl EphemeralRoomState {
         Self {
             burned_uuids: HashSet::new(),
             reserved_uuids: HashSet::new(),
+            reserved_by_peer: HashMap::new(),
             room_secret: Some(room_secret),
         }
     }
@@ -196,6 +200,33 @@ impl EphemeralRoomState {
     pub fn reserved_count(&self) -> usize {
         self.reserved_uuids.len()
     }
+
+    /// Returns the invite currently reserved for `peer_id`, if any.
+    pub fn reserved_invite_for(&self, peer_id: &str) -> Option<InvitePayload> {
+        self.reserved_by_peer.get(peer_id).cloned()
+    }
+
+    /// Atomically reserves `invite_uuid` for `peer_id` and records the invite payload.
+    /// Returns `false` if the UUID is already burned/reserved or capacity is exceeded.
+    pub fn reserve_uuid_for_peer(
+        &mut self,
+        invite_uuid: String,
+        peer_id: &str,
+    ) -> bool {
+        if self.burned_uuids.contains(&invite_uuid) || self.reserved_uuids.contains(&invite_uuid) {
+            return false;
+        }
+        if self.reserved_uuids.len() >= MAX_BURNED_UUIDS {
+            return false;
+        }
+        self.reserved_uuids.insert(invite_uuid);
+        true
+    }
+
+    /// Records the full invite payload reserved for `peer_id` (used for idempotent returns).
+    pub fn record_reserved_invite(&mut self, peer_id: &str, invite: InvitePayload) {
+        self.reserved_by_peer.insert(peer_id.to_string(), invite);
+    }
 }
 
 /// Stateless/ephemeral Cloudflare Durable Object coordinating WebSocket hibernation and dead-drop delivery.
@@ -206,6 +237,8 @@ pub struct DeadDropRoom {
     #[allow(dead_code)]
     env: Env,
     ephemeral: RefCell<EphemeralRoomState>,
+    /// In-memory host election state (atomic within the DO actor).
+    election: RefCell<HostElectionState>,
 }
 
 impl DurableObject for DeadDropRoom {
@@ -214,6 +247,7 @@ impl DurableObject for DeadDropRoom {
             state,
             env,
             ephemeral: RefCell::new(EphemeralRoomState::new()),
+            election: RefCell::new(HostElectionState::new()),
         }
     }
 
@@ -248,15 +282,25 @@ impl DurableObject for DeadDropRoom {
                 with_cors(resp)
             }
             (Method::Get, ["match", do_id]) => {
-                let caller_peer_id = req
-                    .headers()
-                    .get("X-Peer-Id")
-                    .ok()
-                    .flatten()
-                    .filter(|s| !s.trim().is_empty());
+                let caller_peer_id = req.headers().get("X-Peer-Id").ok().flatten();
+                let mut election = self.election.borrow_mut();
                 let resp = handle_do_match(
                     &self.state,
                     &self.ephemeral,
+                    &mut election,
+                    do_id,
+                    caller_peer_id.as_deref(),
+                )
+                .await?;
+                with_cors(resp)
+            }
+            (Method::Get, ["invite", do_id]) => {
+                let caller_peer_id = req.headers().get("X-Peer-Id").ok().flatten();
+                let mut election = self.election.borrow_mut();
+                let resp = handle_do_match(
+                    &self.state,
+                    &self.ephemeral,
+                    &mut election,
                     do_id,
                     caller_peer_id.as_deref(),
                 )
@@ -329,6 +373,7 @@ impl DurableObject for DeadDropRoom {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::HOST_TTL_MS;
 
     #[test]
     fn test_ephemeral_room_state_burn_and_duplicate() {
@@ -365,6 +410,26 @@ mod tests {
         let mut recovered = [0u8; 32];
         recovered.copy_from_slice(&decoded);
         assert_eq!(recovered, secret);
+    }
+
+    #[test]
+    fn test_reserve_uuid_for_peer_is_idempotent_and_isolated() {
+        let mut state = EphemeralRoomState::new();
+        assert!(state.reserve_uuid_for_peer("uuid-a".to_string(), "peer-1"));
+        assert!(!state.reserve_uuid_for_peer("uuid-a".to_string(), "peer-2"));
+        assert!(state.is_reserved("uuid-a"));
+        assert_eq!(state.reserved_count(), 1);
+    }
+
+    #[test]
+    fn test_host_election_state_lease_expiry() {
+        let mut election = HostElectionState::new();
+        assert!(!election.is_host_active(0.0));
+        election.host_peer_id = Some("peer-1".to_string());
+        election.host_claimed_at = Some(1_000.0);
+        assert!(election.is_host_active(1_000.0));
+        assert!(election.is_host_active(1_000.0 + HOST_TTL_MS - 1.0));
+        assert!(!election.is_host_active(1_000.0 + HOST_TTL_MS + 1.0));
     }
 
     #[test]

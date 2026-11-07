@@ -2,6 +2,7 @@
 //! for the stateless Cloudflare Worker & Hibernating Durable Object signaling bootstrap.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fmt;
 
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
@@ -34,6 +35,13 @@ pub const HOST_TTL_MS: f64 = 8_000.0;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageInviteRequest {
     pub invite: InvitePayload,
+}
+
+/// A staged invite together with the peer id of the host that staged it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagedInvite {
+    pub invite: InvitePayload,
+    pub host_peer_id: String,
 }
 
 /// Response returned by `GET /match/:do_id`.
@@ -841,71 +849,150 @@ pub fn reserve_staged_invite<S: HibernatingSocket>(
     None
 }
 
+/// Reserves the first unburned, unreserved staged invite belonging to `active_host_peer_id`
+/// for `joiner_peer_id`. Idempotent: if `joiner_peer_id` already holds a reservation, the
+/// same invite is returned without consuming another.
+///
+/// Returns `None` if no invite is available from the active host.
+pub fn reserve_staged_invite_for_peer<S: HibernatingSocket>(
+    room_state: &mut EphemeralRoomState,
+    host_sockets: &[S],
+    active_host_peer_id: &str,
+    joiner_peer_id: &str,
+) -> Option<InvitePayload> {
+    // Idempotent: return the joiner's existing reservation if still valid.
+    if let Some(existing) = room_state.reserved_invite_for(joiner_peer_id) {
+        if !room_state.is_burned(&existing.invite_uuid) {
+            return Some(existing);
+        }
+    }
+
+    for sock in host_sockets.iter() {
+        if let Ok(Some(att)) = sock.recover_host_secret() {
+            if let Some(ref inv) = att.staged_invite {
+                if room_state.is_burned(&inv.invite_uuid) || room_state.is_reserved(&inv.invite_uuid)
+                {
+                    continue;
+                }
+                if room_state.reserve_uuid_for_peer(inv.invite_uuid.clone(), joiner_peer_id) {
+                    room_state.record_reserved_invite(joiner_peer_id, inv.clone());
+                    return Some(inv.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// In-memory host election state owned by the Durable Object actor.
+///
+/// All reads/writes happen synchronously within a single DO actor instance, so host
+/// election and invite reservation are strictly serial and atomic.
+#[derive(Debug, Default, Clone)]
+pub struct HostElectionState {
+    pub host_peer_id: Option<String>,
+    pub host_claimed_at: Option<f64>,
+    pub room_secret: Option<[u8; 32]>,
+}
+
+impl HostElectionState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` if a host is currently elected and its lease has not expired.
+    pub fn is_host_active(&self, now: f64) -> bool {
+        match (self.host_peer_id.as_ref(), self.host_claimed_at) {
+            (Some(_), Some(ts)) => now <= ts + HOST_TTL_MS,
+            _ => false,
+        }
+    }
+}
+
 /// Cloudflare Durable Object adapter for `GET /match/:do_id`.
 ///
-/// Ensures the room secret exists in DO storage, then resolves the caller's role:
-/// 1. If an unburned staged invite exists, returns `status: "joiner"` with the invite.
-/// 2. If the caller is the current host (lease still valid), refreshes the lease and returns `status: "host"`.
-/// 3. If another host holds a valid lease, returns `status: "waiting"`.
-/// 4. Otherwise elects the caller as host and returns `status: "host"`.
+/// Requires a non-empty `X-Peer-Id` header (400 otherwise). Resolves the caller's role
+/// using strictly serial in-memory host election:
+/// 1. If the caller is the current host (lease valid), refresh the lease and return `status: "host"`.
+/// 2. If no host is active, atomically elect the caller as host and return `status: "host"`.
+/// 3. Otherwise the caller is a joiner: idempotently reserve a staged invite from the active host.
+/// 4. If no invite is available, return `status: "waiting"`.
 pub async fn handle_do_match(
     state: &State,
     ephemeral: &RefCell<EphemeralRoomState>,
+    election: &mut HostElectionState,
     do_id: &str,
     caller_peer_id: Option<&str>,
 ) -> Result<Response> {
-    let room_secret = load_or_init_room_secret(state).await?;
+    // M3: X-Peer-Id is strictly required.
+    let peer = match caller_peer_id.map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(p) => p.to_string(),
+        None => {
+            return with_cors(Response::error("Missing or empty X-Peer-Id header", 400)?);
+        }
+    };
+
+    // H2: Initialize the room secret exactly once, persist it, and cache it in memory.
+    let room_secret = match election.room_secret {
+        Some(secret) => secret,
+        None => {
+            let secret = load_or_init_room_secret(state).await?;
+            election.room_secret = Some(secret);
+            secret
+        }
+    };
     ephemeral.borrow_mut().set_room_secret(room_secret);
+    let room_secret_hex = hex::encode(room_secret);
 
     let storage = state.storage();
     let now = now_ms();
-    let peer = caller_peer_id
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("anonymous")
-        .to_string();
 
-    // 1. Host-First Check: if the caller is the current host, refresh the lease and return host.
-    let existing_host: Option<String> = storage
-        .get::<String>(HOST_PEER_ID_STORAGE_KEY)
-        .await
-        .ok()
-        .flatten();
-    let claimed_at: f64 = storage
-        .get::<f64>(HOST_CLAIMED_AT_STORAGE_KEY)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(0.0);
-
-    let caller_is_host = existing_host.as_deref() == Some(peer.as_str());
-    if caller_is_host {
+    // H1: Host-first check — refresh lease if caller is the current host.
+    if election.host_peer_id.as_deref() == Some(peer.as_str()) {
+        election.host_claimed_at = Some(now);
         storage.put(HOST_CLAIMED_AT_STORAGE_KEY, now).await?;
         let body = serde_json::json!({
             "status": "host",
             "do_id": do_id,
-            "room_secret": hex::encode(room_secret),
+            "room_secret": room_secret_hex,
         });
         let mut resp = Response::ok(serde_json::to_string(&body).unwrap_or_default())?;
         resp.headers_mut().set("Content-Type", "application/json")?;
         return with_cors(resp);
     }
 
-    // 2. Joiner path: atomically reserve a staged invite so concurrent joiners never collide.
+    // H1: If no host is active, atomically elect the caller as host.
+    if !election.is_host_active(now) {
+        election.host_peer_id = Some(peer.clone());
+        election.host_claimed_at = Some(now);
+        storage.put(HOST_PEER_ID_STORAGE_KEY, peer.clone()).await?;
+        storage.put(HOST_CLAIMED_AT_STORAGE_KEY, now).await?;
+        let body = serde_json::json!({
+            "status": "host",
+            "do_id": do_id,
+            "room_secret": room_secret_hex,
+        });
+        let mut resp = Response::ok(serde_json::to_string(&body).unwrap_or_default())?;
+        resp.headers_mut().set("Content-Type", "application/json")?;
+        return with_cors(resp);
+    }
+
+    // H3/M4/M5: Caller is a joiner. Idempotently reserve an invite from the active host.
+    let active_host = election.host_peer_id.clone().unwrap_or_default();
     let mut sockets = state.get_websockets_with_tag(HOST_WEBSOCKET_TAG);
     if sockets.is_empty() {
         sockets = state.get_websockets();
     }
     let reserved_invite = {
         let mut room_state = ephemeral.borrow_mut();
-        reserve_staged_invite(&mut room_state, &sockets)
+        reserve_staged_invite_for_peer(&mut room_state, &sockets, &active_host, &peer)
     };
 
     if let Some(invite) = reserved_invite {
         let body = serde_json::json!({
             "status": "joiner",
             "do_id": do_id,
-            "room_secret": hex::encode(room_secret),
+            "room_secret": room_secret_hex,
             "assigned_peer_id": peer,
             "invite": invite,
         });
@@ -914,28 +1001,12 @@ pub async fn handle_do_match(
         return with_cors(resp);
     }
 
-    // 3. No invite available: check host lease validity.
-    let lease_valid = existing_host.is_some() && (now - claimed_at) < HOST_TTL_MS;
-
-    if lease_valid {
-        let body = serde_json::json!({
-            "status": "waiting",
-            "do_id": do_id,
-            "room_secret": hex::encode(room_secret),
-            "host_peer_id": existing_host,
-        });
-        let mut resp = Response::ok(serde_json::to_string(&body).unwrap_or_default())?;
-        resp.headers_mut().set("Content-Type", "application/json")?;
-        return with_cors(resp);
-    }
-
-    // 4. Lease expired or no host: elect the caller as host.
-    storage.put(HOST_PEER_ID_STORAGE_KEY, peer.clone()).await?;
-    storage.put(HOST_CLAIMED_AT_STORAGE_KEY, now).await?;
+    // No invite available: caller waits for the active host to stage one.
     let body = serde_json::json!({
-        "status": "host",
+        "status": "waiting",
         "do_id": do_id,
-        "room_secret": hex::encode(room_secret),
+        "room_secret": room_secret_hex,
+        "host_peer_id": election.host_peer_id,
     });
     let mut resp = Response::ok(serde_json::to_string(&body).unwrap_or_default())?;
     resp.headers_mut().set("Content-Type", "application/json")?;
