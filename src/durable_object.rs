@@ -293,9 +293,6 @@ impl DurableObject for DeadDropRoom {
             state_restored: std::cell::Cell::new(false),
         }
     }
-}
-
-impl DeadDropRoom {
     /// Lazily restores persisted host election state and room secret from DO storage.
     ///
     /// Called at the top of `fetch()` so cold-started Durable Objects recover the
@@ -335,9 +332,7 @@ impl DeadDropRoom {
         self.state_restored.set(true);
         Ok(())
     }
-}
 
-impl DurableObject for DeadDropRoom {
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         // Lazy cold-start restoration of persisted host election / room secret.
         self.ensure_state_restored().await?;
