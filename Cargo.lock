@@ -1010,6 +1010,7 @@ name = "zero_network"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "getrandom",
  "hex",
  "serde",
  "serde_json",
