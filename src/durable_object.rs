@@ -269,36 +269,13 @@ pub struct DeadDropRoom {
     state_restored: std::cell::Cell<bool>,
 }
 
-impl DurableObject for DeadDropRoom {
-    fn new(state: State, env: Env) -> Self {
-        // Cold-start restoration: read persisted host election state from DO storage.
-        // `new` is synchronous, so we spawn a task that populates the in-memory
-        // election state once storage resolves. Until then, the first `/match`
-        // call will lazily re-elect a host (safe fallback).
-        let election = RefCell::new(HostElectionState::new());
-        {
-            let storage = state.storage();
-            let election_ref = &election;
-            // Use a scoped block to avoid holding any borrow across await points.
-            // We cannot await here (sync fn), so we schedule restoration via
-            // `state.wait_until`-style background task if available; otherwise
-            // rely on lazy re-election in `handle_do_match`.
-            let _ = (storage, election_ref);
-        }
-        Self {
-            state,
-            env,
-            ephemeral: RefCell::new(EphemeralRoomState::new()),
-            election,
-            state_restored: std::cell::Cell::new(false),
-        }
-    }
+impl DeadDropRoom {
     /// Lazily restores persisted host election state and room secret from DO storage.
     ///
     /// Called at the top of `fetch()` so cold-started Durable Objects recover the
     /// previously-elected host and room secret before handling any route. Runs at
     /// most once per actor instance.
-    async fn ensure_state_restored(&self) -> Result<()> {
+    pub async fn ensure_state_restored(&self) -> Result<()> {
         if self.state_restored.get() {
             return Ok(());
         }
@@ -332,7 +309,32 @@ impl DurableObject for DeadDropRoom {
         self.state_restored.set(true);
         Ok(())
     }
+}
 
+impl DurableObject for DeadDropRoom {
+    fn new(state: State, env: Env) -> Self {
+        // Cold-start restoration: read persisted host election state from DO storage.
+        // `new` is synchronous, so we spawn a task that populates the in-memory
+        // election state once storage resolves. Until then, the first `/match`
+        // call will lazily re-elect a host (safe fallback).
+        let election = RefCell::new(HostElectionState::new());
+        {
+            let storage = state.storage();
+            let election_ref = &election;
+            // Use a scoped block to avoid holding any borrow across await points.
+            // We cannot await here (sync fn), so we schedule restoration via
+            // `state.wait_until`-style background task if available; otherwise
+            // rely on lazy re-election in `handle_do_match`.
+            let _ = (storage, election_ref);
+        }
+        Self {
+            state,
+            env,
+            ephemeral: RefCell::new(EphemeralRoomState::new()),
+            election,
+            state_restored: std::cell::Cell::new(false),
+        }
+    }
     async fn fetch(&self, mut req: Request) -> Result<Response> {
         // Lazy cold-start restoration of persisted host election / room secret.
         self.ensure_state_restored().await?;
