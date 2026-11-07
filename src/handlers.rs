@@ -677,13 +677,26 @@ pub fn handle_do_host_upgrade_with_secret(
     let client = pair.client;
 
     // Record the owning host peer id (if provided) so staged invites can be
-    // filtered to the active host during `/match`.
+    // filtered to the active host during `/match`. Prefer the `X-Peer-Id`
+    // header; fall back to the `?peer_id=...` query parameter for browser
+    // WebSocket clients that cannot set custom headers.
     let mut attachment = HostAttachment::new(host_secret);
-    if let Ok(Some(peer_id)) = req.headers().get("X-Peer-Id") {
-        let trimmed = peer_id.trim();
-        if !trimmed.is_empty() {
-            attachment = attachment.with_host_peer_id(trimmed);
-        }
+    let header_peer_id = req
+        .headers()
+        .get("X-Peer-Id")
+        .ok()
+        .flatten()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let peer_id = match header_peer_id {
+        Some(p) => Some(p),
+        None => req
+            .url()
+            .ok()
+            .and_then(|u| parse_query_peer_id(u.as_str())),
+    };
+    if let Some(peer_id) = peer_id {
+        attachment = attachment.with_host_peer_id(peer_id);
     }
 
     if let Err(err) = server.attach_host_secret(&attachment) {
@@ -877,10 +890,30 @@ pub fn reserve_staged_invite_for_peer<S: HibernatingSocket>(
     active_host_peer_id: &str,
     joiner_peer_id: &str,
 ) -> Option<InvitePayload> {
-    // Idempotent: return the joiner's existing reservation if still valid.
+    // Idempotent: return the joiner's existing reservation if still valid AND
+    // still staged by the currently-active host. Reservations tied to a stale
+    // (expired) host are discarded so the joiner can be re-matched.
     if let Some(existing) = room_state.reserved_invite_for(joiner_peer_id) {
         if !room_state.is_burned(&existing.invite_uuid) {
-            return Some(existing);
+            let still_owned_by_active_host = host_sockets.iter().any(|sock| {
+                sock.recover_host_secret()
+                    .ok()
+                    .flatten()
+                    .map(|att| {
+                        att.host_peer_id.as_deref() == Some(active_host_peer_id)
+                            && att
+                                .staged_invite
+                                .as_ref()
+                                .map(|inv| inv.invite_uuid == existing.invite_uuid)
+                                .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+            });
+            if still_owned_by_active_host {
+                return Some(existing);
+            }
+            // Stale reservation: drop it so a fresh invite can be reserved below.
+            room_state.clear_reservation(&existing.invite_uuid, joiner_peer_id);
         }
     }
 
@@ -1077,6 +1110,30 @@ pub async fn handle_do_match(
     let mut resp = Response::ok(serde_json::to_string(&body).unwrap_or_default())?;
     resp.headers_mut().set("Content-Type", "application/json")?;
     with_cors(resp)
+}
+
+/// Extracts `?peer_id=<value>` from a URL or query string.
+///
+/// Used as a fallback for browser WebSocket clients that cannot set the
+/// `X-Peer-Id` header on the upgrade request.
+pub fn parse_query_peer_id(url_or_query: &str) -> Option<String> {
+    let query_part = if let Some(idx) = url_or_query.find('?') {
+        &url_or_query[idx + 1..]
+    } else {
+        url_or_query
+    };
+
+    for pair in query_part.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        let key = parts.next()?.trim();
+        if key == "peer_id" {
+            let value = parts.next().unwrap_or("").trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Validates and normalizes the caller's `X-Peer-Id` header value.

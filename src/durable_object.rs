@@ -14,6 +14,7 @@ use zero_protocol::InvitePayload;
 use crate::handlers::{
     cors_preflight_response, handle_do_dead_drop, handle_do_host_upgrade_with_secret, handle_do_match,
     handle_do_stage_invite, with_cors, HostElectionState, StageInviteRequest,
+    HOST_CLAIMED_AT_STORAGE_KEY, HOST_PEER_ID_STORAGE_KEY, ROOM_SECRET_STORAGE_KEY,
 };
 
 /// Cloudflare Worker environment binding name for the signaling Durable Object namespace.
@@ -239,6 +240,19 @@ impl EphemeralRoomState {
     pub fn record_reserved_invite(&mut self, peer_id: &str, invite: InvitePayload) {
         self.reserved_by_peer.insert(peer_id.to_string(), invite);
     }
+
+    /// Clears a stale reservation for `invite_uuid` held by `peer_id`.
+    ///
+    /// Used when the host that staged the invite is no longer the active host,
+    /// so the joiner can be re-matched against the current host.
+    pub fn clear_reservation(&mut self, invite_uuid: &str, peer_id: &str) {
+        self.reserved_uuids.remove(invite_uuid);
+        if let Some(existing) = self.reserved_by_peer.get(peer_id) {
+            if existing.invite_uuid == invite_uuid {
+                self.reserved_by_peer.remove(peer_id);
+            }
+        }
+    }
 }
 
 /// Stateless/ephemeral Cloudflare Durable Object coordinating WebSocket hibernation and dead-drop delivery.
@@ -251,6 +265,8 @@ pub struct DeadDropRoom {
     ephemeral: RefCell<EphemeralRoomState>,
     /// In-memory host election state (atomic within the DO actor).
     election: RefCell<HostElectionState>,
+    /// Whether persisted host election / room secret state has been lazily restored.
+    state_restored: std::cell::Cell<bool>,
 }
 
 impl DurableObject for DeadDropRoom {
@@ -274,10 +290,58 @@ impl DurableObject for DeadDropRoom {
             env,
             ephemeral: RefCell::new(EphemeralRoomState::new()),
             election,
+            state_restored: std::cell::Cell::new(false),
         }
     }
+}
 
+impl DeadDropRoom {
+    /// Lazily restores persisted host election state and room secret from DO storage.
+    ///
+    /// Called at the top of `fetch()` so cold-started Durable Objects recover the
+    /// previously-elected host and room secret before handling any route. Runs at
+    /// most once per actor instance.
+    async fn ensure_state_restored(&self) -> Result<()> {
+        if self.state_restored.get() {
+            return Ok(());
+        }
+
+        let storage = self.state.storage();
+
+        if let Ok(Some(host_id)) = storage.get::<String>(HOST_PEER_ID_STORAGE_KEY).await {
+            let trimmed = host_id.trim();
+            if !trimmed.is_empty() {
+                self.election.borrow_mut().host_peer_id = Some(trimmed.to_string());
+            }
+        }
+
+        if let Ok(Some(claimed_at)) = storage.get::<f64>(HOST_CLAIMED_AT_STORAGE_KEY).await {
+            if claimed_at.is_finite() && claimed_at > 0.0 {
+                self.election.borrow_mut().host_claimed_at = Some(claimed_at);
+            }
+        }
+
+        if let Ok(Some(hex_secret)) = storage.get::<String>(ROOM_SECRET_STORAGE_KEY).await {
+            if let Ok(bytes) = hex::decode(hex_secret.trim()) {
+                if bytes.len() == 32 {
+                    let mut secret = [0u8; 32];
+                    secret.copy_from_slice(&bytes);
+                    self.election.borrow_mut().room_secret = Some(secret);
+                    self.ephemeral.borrow_mut().set_room_secret(secret);
+                }
+            }
+        }
+
+        self.state_restored.set(true);
+        Ok(())
+    }
+}
+
+impl DurableObject for DeadDropRoom {
     async fn fetch(&self, mut req: Request) -> Result<Response> {
+        // Lazy cold-start restoration of persisted host election / room secret.
+        self.ensure_state_restored().await?;
+
         if req.method() == Method::Options {
             return cors_preflight_response();
         }
