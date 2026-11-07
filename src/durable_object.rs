@@ -370,7 +370,13 @@ impl DurableObject for DeadDropRoom {
                 with_cors(resp)
             }
             (Method::Get, ["match", do_id]) => {
-                let caller_peer_id = req.headers().get("X-Peer-Id").ok().flatten();
+                let header_peer_id = req.headers().get("X-Peer-Id").ok().flatten();
+                let query_peer_id = req
+                    .url()
+                    .ok()
+                    .and_then(|u| crate::handlers::parse_query_peer_id(u.as_str()));
+                let caller_peer_id =
+                    crate::handlers::extract_peer_id(header_peer_id.as_deref(), query_peer_id.as_deref());
                 // Take a snapshot of election state, drop the borrow, then await.
                 let mut election_snapshot = self.election.borrow().clone();
                 let resp = handle_do_match(
@@ -386,7 +392,13 @@ impl DurableObject for DeadDropRoom {
                 with_cors(resp)
             }
             (Method::Get, ["invite", do_id]) => {
-                let caller_peer_id = req.headers().get("X-Peer-Id").ok().flatten();
+                let header_peer_id = req.headers().get("X-Peer-Id").ok().flatten();
+                let query_peer_id = req
+                    .url()
+                    .ok()
+                    .and_then(|u| crate::handlers::parse_query_peer_id(u.as_str()));
+                let caller_peer_id =
+                    crate::handlers::extract_peer_id(header_peer_id.as_deref(), query_peer_id.as_deref());
                 let mut election_snapshot = self.election.borrow().clone();
                 let resp = handle_do_match(
                     &self.state,

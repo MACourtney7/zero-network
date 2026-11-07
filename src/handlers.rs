@@ -65,7 +65,7 @@ pub enum MatchResponse {
 
 pub const CORS_ALLOW_ORIGIN: &str = "*";
 pub const CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
-pub const CORS_ALLOW_HEADERS: &str = "Content-Type, Authorization, X-Host-Secret";
+pub const CORS_ALLOW_HEADERS: &str = "Content-Type, Authorization, X-Host-Secret, X-Peer-Id";
 pub const CORS_MAX_AGE: &str = "86400";
 
 /// Returns standard CORS headers as key-value pairs.
@@ -426,7 +426,17 @@ pub fn process_dead_drop<S: HibernatingSocket>(
             .map_err(NetworkError::SocketError)?
         {
             found_any_attachment = true;
-            if verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok() {
+            // Prefer matching by the staged invite UUID so the drop is routed to the
+            // exact host socket that staged this invite. Fall back to HMAC verification
+            // for hosts that did not stage an invite (legacy behavior).
+            let staged_matches = att
+                .staged_invite
+                .as_ref()
+                .map(|i| i.invite_uuid.as_str())
+                == Some(path_invite_uuid);
+            if staged_matches
+                || verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok()
+            {
                 matching_idx = Some(idx);
                 break;
             }
@@ -445,6 +455,22 @@ pub fn process_dead_drop<S: HibernatingSocket>(
     }
     if !room_state.burn_uuid(path_invite_uuid.to_string()) {
         return Err(NetworkError::BurnCapacityExceeded);
+    }
+
+    // Clear the consumed staged invite on the matching host socket so it cannot be
+    // served again to another joiner via `/match` or `/invite`.
+    if let Ok(Some(mut att)) = host_sockets[target_idx].recover_host_secret() {
+        if att
+            .staged_invite
+            .as_ref()
+            .map(|i| i.invite_uuid.as_str())
+            == Some(path_invite_uuid)
+        {
+            att.staged_invite = None;
+            host_sockets[target_idx]
+                .attach_host_secret(&att)
+                .map_err(NetworkError::SocketError)?;
+        }
     }
 
     // Pipe serialized DropPayload strictly to that matching host socket.
@@ -474,7 +500,7 @@ pub fn with_cors(mut resp: Response) -> Result<Response> {
     headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")?;
     headers.set(
         "Access-Control-Allow-Headers",
-        "Content-Type, Authorization, X-Host-Secret",
+        "Content-Type, Authorization, X-Host-Secret, X-Peer-Id",
     )?;
     headers.set("Access-Control-Max-Age", "86400")?;
 
@@ -1131,6 +1157,28 @@ pub fn parse_query_peer_id(url_or_query: &str) -> Option<String> {
             if !value.is_empty() {
                 return Some(value.to_string());
             }
+        }
+    }
+    None
+}
+
+/// Extracts the caller's peer id, preferring the `X-Peer-Id` header over the
+/// `?peer_id=` URL query parameter. Returns `None` if neither is present or
+/// both are empty after trimming.
+pub fn extract_peer_id(
+    x_peer_id: Option<&str>,
+    query_peer_id: Option<&str>,
+) -> Option<String> {
+    if let Some(header) = x_peer_id {
+        let trimmed = header.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(query) = query_peer_id {
+        let trimmed = query.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
         }
     }
     None

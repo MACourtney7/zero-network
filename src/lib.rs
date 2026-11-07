@@ -35,6 +35,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .options("/host/:do_id", |_, _| cors_preflight_response())
         .options("/stage/:do_id", |_, _| cors_preflight_response())
         .options("/match/:do_id", |_, _| cors_preflight_response())
+        .options("/invite/:do_id", |_, _| cors_preflight_response())
         .options("/drop/:do_id/:invite_uuid", |_, _| {
             cors_preflight_response()
         })
@@ -89,6 +90,42 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/match", |_req, _ctx| async move {
             with_cors(Response::error("Missing Durable Object ID", 400)?)
+        })
+        .get_async("/invite/:do_id", |req, ctx| async move {
+            let do_id = match ctx.param("do_id") {
+                Some(id) if !id.trim().is_empty() => id,
+                _ => return with_cors(Response::error("Missing Durable Object ID", 400)?),
+            };
+            let namespace = ctx.durable_object(DEAD_DROP_BINDING)?;
+            let stub = namespace.id_from_name(do_id)?.get_stub()?;
+            let mut resp = match stub.fetch_with_request(req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err_resp = Response::error(format!("Durable Object error: {e}"), 500)?;
+                    return with_cors(err_resp);
+                }
+            };
+
+            let status = resp.status_code();
+            let content_type = resp
+                .headers()
+                .get("Content-Type")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "application/json".to_string());
+            let body_text = resp.text().await.unwrap_or_default();
+            let fresh_resp = if (200..300).contains(&status) {
+                let mut r = Response::ok(body_text)?;
+                if status != 200 {
+                    r = r.with_status(status);
+                }
+                r.headers_mut().set("Content-Type", &content_type)?;
+                r
+            } else {
+                Response::error(body_text, status)?
+            };
+
+            with_cors(fresh_resp)
         })
         .get_async("/match/:do_id", |req, ctx| async move {
             let do_id = match ctx.param("do_id") {
