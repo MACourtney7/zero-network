@@ -995,7 +995,7 @@ fn test_universal_cors_headers_and_options_preflight() {
     );
     assert_eq!(
         preflight.get_header("Access-Control-Allow-Headers"),
-        Some("Content-Type, Authorization, X-Host-Secret")
+        Some("Content-Type, Authorization, X-Host-Secret, X-Peer-Id")
     );
     assert_eq!(
         preflight.get_header("Access-Control-Max-Age"),
@@ -1015,7 +1015,7 @@ fn test_universal_cors_headers_and_options_preflight() {
     );
     assert_eq!(
         ice_resp.get_header("Access-Control-Allow-Headers"),
-        Some("Content-Type, Authorization, X-Host-Secret")
+        Some("Content-Type, Authorization, X-Host-Secret, X-Peer-Id")
     );
 
     // 3. /match/:do_id standard response has CORS headers attached
@@ -1034,7 +1034,7 @@ fn test_universal_cors_headers_and_options_preflight() {
     );
     assert_eq!(
         match_resp.get_header("Access-Control-Allow-Headers"),
-        Some("Content-Type, Authorization, X-Host-Secret")
+        Some("Content-Type, Authorization, X-Host-Secret, X-Peer-Id")
     );
 
     // 4. /stage/:do_id standard response has CORS headers attached
@@ -1070,7 +1070,7 @@ fn test_universal_cors_headers_and_options_preflight() {
     );
     assert_eq!(
         stage_resp.get_header("Access-Control-Allow-Headers"),
-        Some("Content-Type, Authorization, X-Host-Secret")
+        Some("Content-Type, Authorization, X-Host-Secret, X-Peer-Id")
     );
 
     // 5. In Wasm runtime contexts, verify worker::Response wrappers directly
