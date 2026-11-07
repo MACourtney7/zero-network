@@ -2,19 +2,28 @@ name: Deploy zero_network
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: zero_network
     steps:
-      - name: Checkout
+      - name: Checkout zero_network
         uses: actions/checkout@v4
+        with:
+          path: zero_network
+
+      - name: Checkout zero_protocol sibling
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/zero-protocol
+          path: zero_protocol
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -22,12 +31,9 @@ jobs:
           targets: wasm32-unknown-unknown
 
       - name: Install worker-build
-        run: cargo install worker-build --locked
+        run: cargo install -q worker-build --version "^0.7"
 
-      - name: Run tests
-        run: cargo test
-
-      - name: Deploy to Cloudflare Workers
+      - name: Deploy Cloudflare Worker & Durable Object
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}

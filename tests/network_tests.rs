@@ -5,8 +5,8 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use zero_network::{
     authenticate_host, constant_time_eq, default_ice_servers_json, extract_bearer_token,
-    extract_secret_from_params, parse_custom_ice_servers, parse_host_secret, parse_query_secret,
-    process_dead_drop, process_host_query_upgrade, process_host_upgrade,
+    extract_peer_id, extract_secret_from_params, parse_custom_ice_servers, parse_host_secret,
+    parse_query_secret, process_dead_drop, process_host_query_upgrade, process_host_upgrade,
     process_host_upgrade_authenticated, process_ice_servers, process_match_request,
     process_stage_invite, EphemeralRoomState, HibernatingSocket, HostAttachment, HttpResponse,
     MatchResponse, MockHostSocket, NetworkError, StageInviteRequest, MAX_BURNED_UUIDS,
@@ -978,6 +978,102 @@ fn test_host_query_secret_authentication() {
     )
     .expect("authenticated upgrade with query secret should succeed");
     assert_eq!(res_auth.status, 101);
+}
+
+#[test]
+fn test_extract_peer_id_precedence_and_trimming() {
+    // Header takes precedence over query parameter.
+    assert_eq!(
+        extract_peer_id(Some("header-peer"), Some("query-peer")),
+        Some("header-peer".to_string())
+    );
+
+    // Whitespace around the header value is trimmed.
+    assert_eq!(
+        extract_peer_id(Some("   header-peer   "), None),
+        Some("header-peer".to_string())
+    );
+
+    // Whitespace around the query value is trimmed when header is absent.
+    assert_eq!(
+        extract_peer_id(None, Some("  query-peer  ")),
+        Some("query-peer".to_string())
+    );
+
+    // Empty/whitespace header falls back to query.
+    assert_eq!(
+        extract_peer_id(Some("   "), Some("query-peer")),
+        Some("query-peer".to_string())
+    );
+
+    // Both empty -> None.
+    assert_eq!(extract_peer_id(Some(""), Some("   ")), None);
+    assert_eq!(extract_peer_id(None, None), None);
+}
+
+#[test]
+fn test_dead_drop_staged_invite_requires_hmac_and_clears_staged() {
+    let host_secret = [0x5Au8; 32];
+    let invite_uuid = "staged-invite-hmac-required";
+
+    // Host upgrades and stages an invite on its socket.
+    let mut host_socket = MockHostSocket::new();
+    process_host_upgrade(
+        Some("websocket"),
+        Some(&hex::encode(host_secret)),
+        &mut host_socket,
+    )
+    .expect("host upgrade");
+
+    let valid_token = compute_invite_token(&host_secret, invite_uuid)
+        .expect("compute token")
+        .hmac_hex;
+    let invite = sample_invite_payload("room-staged", invite_uuid, &valid_token, [0x66u8; 32]);
+    host_socket
+        .attach_host_secret(&HostAttachment::with_staged_invite(host_secret, invite))
+        .unwrap();
+
+    let mut sockets = vec![host_socket];
+    let mut room_state = EphemeralRoomState::new();
+
+    // 1. Matching staged invite UUID but INVALID token must be rejected with 403.
+    let bad_payload = sample_drop_payload(invite_uuid, "deadbeef-invalid-hmac");
+    let bad_bytes = to_json_bytes(&bad_payload).expect("serialize bad payload");
+
+    let err = process_dead_drop(invite_uuid, None, &bad_bytes, &mut room_state, &mut sockets)
+        .expect_err("staged match with invalid HMAC must be rejected");
+    assert_eq!(err, NetworkError::ForbiddenHmac);
+    assert_eq!(err.status_code(), 403);
+
+    // Invite must NOT be burned, no message sent, and staged invite must remain.
+    assert!(!room_state.is_burned(invite_uuid));
+    assert!(sockets[0].sent_messages.is_empty());
+    assert!(sockets[0]
+        .recover_host_secret()
+        .unwrap()
+        .unwrap()
+        .staged_invite
+        .is_some());
+
+    // 2. Matching staged invite UUID with VALID token succeeds and clears staged invite.
+    let good_payload = sample_drop_payload(invite_uuid, &valid_token);
+    let good_bytes = to_json_bytes(&good_payload).expect("serialize good payload");
+
+    let res = process_dead_drop(invite_uuid, None, &good_bytes, &mut room_state, &mut sockets)
+        .expect("staged match with valid HMAC should succeed");
+    assert_eq!(res.status, 200);
+
+    // Invite burned, message delivered, staged invite cleared.
+    assert!(room_state.is_burned(invite_uuid));
+    assert_eq!(sockets[0].sent_messages.len(), 1);
+    let received: DropPayload = from_json_str(&sockets[0].sent_messages[0]).unwrap();
+    assert_eq!(received, good_payload);
+    assert!(sockets[0]
+        .recover_host_secret()
+        .unwrap()
+        .unwrap()
+        .staged_invite
+        .is_none());
 }
 
 #[test]

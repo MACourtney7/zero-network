@@ -426,16 +426,16 @@ pub fn process_dead_drop<S: HibernatingSocket>(
             .map_err(NetworkError::SocketError)?
         {
             found_any_attachment = true;
-            // Prefer matching by the staged invite UUID so the drop is routed to the
-            // exact host socket that staged this invite. Fall back to HMAC verification
-            // for hosts that did not stage an invite (legacy behavior).
+            // Route the drop to the exact host socket that staged this invite, but
+            // NEVER accept a staged-invite match without verifying the HMAC token.
+            // A matching staged UUID alone is not sufficient authorization.
             let staged_matches = att
                 .staged_invite
                 .as_ref()
                 .map(|i| i.invite_uuid.as_str())
                 == Some(path_invite_uuid);
             if staged_matches
-                || verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok()
+                && verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok()
             {
                 matching_idx = Some(idx);
                 break;
