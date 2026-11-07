@@ -37,7 +37,18 @@ jobs:
       - name: Install worker-build
         run: cargo install -q worker-build --version "^0.7"
 
+      - name: Check Cloudflare Credentials
+        id: check_creds
+        run: |
+          if [ -z "${{ secrets.CLOUDFLARE_API_TOKEN }}" ]; then
+            echo "::warning ::CLOUDFLARE_API_TOKEN secret is not configured on zero-network. Skipping deployment."
+            echo "has_token=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_token=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Deploy Cloudflare Worker & Durable Object
+        if: steps.check_creds.outputs.has_token == 'true'
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -845,6 +856,8 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_S
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use worker::{Headers, Request, RequestInit, Response, Result, State, WebSocketPair};
+#[cfg(target_arch = "wasm32")]
+use worker::wasm_bindgen::JsCast;
 use zero_protocol::crypto::verify_invite_token;
 use zero_protocol::{from_json_bytes, to_json_string, DropPayload, InvitePayload};
 
