@@ -18,6 +18,18 @@ use crate::durable_object::{
 /// Maximum permitted HTTP body size (64 KiB) for `POST /drop/:do_id/:invite_uuid`.
 pub const MAX_DROP_BODY_BYTES: usize = 65_536;
 
+/// Durable Object storage key holding the authoritative 32-byte room secret (hex-encoded).
+pub const ROOM_SECRET_STORAGE_KEY: &str = "room_secret";
+
+/// Durable Object storage key holding the current host peer id.
+pub const HOST_PEER_ID_STORAGE_KEY: &str = "host_peer_id";
+
+/// Durable Object storage key holding the host claim timestamp (ms since UNIX epoch).
+pub const HOST_CLAIMED_AT_STORAGE_KEY: &str = "host_claimed_at";
+
+/// Host election TTL in milliseconds. A dead host releases the room after this window.
+pub const HOST_TTL_MS: f64 = 8_000.0;
+
 /// Payload accepted by `POST /stage/:do_id` or sent over active host WebSocket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageInviteRequest {
@@ -702,30 +714,134 @@ pub async fn handle_do_stage_invite(
     }
 }
 
+/// Returns the current UNIX epoch time in milliseconds as `f64`.
+pub fn now_ms() -> f64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        worker::js_sys::Date::now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0)
+    }
+}
+
+/// Generates 32 cryptographically-random bytes for a fresh room secret.
+pub fn generate_room_secret() -> [u8; 32] {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use worker::js_sys;
+        let mut buf = [0u8; 32];
+        let arr = js_sys::Uint8Array::new_with_length(32);
+        let crypto = js_sys::Reflect::get(&js_sys::global(), &js_sys::JsString::from("crypto"))
+            .ok()
+            .and_then(|c| {
+                js_sys::Reflect::get(&c, &js_sys::JsString::from("getRandomValues")).ok()
+            })
+            .and_then(|f| f.dyn_ref::<js_sys::Function>().cloned());
+        if let Some(f) = crypto {
+            let _ = f.call1(&js_sys::JsValue::UNDEFINED, &arr);
+            arr.copy_to(&mut buf);
+        }
+        buf
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let mut buf = [0u8; 32];
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut x = (nanos as u64) ^ 0x9E37_79B9_7F4A_7C15;
+        for chunk in buf.chunks_mut(8) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let bytes = x.to_le_bytes();
+            chunk.copy_from_slice(&bytes[..chunk.len()]);
+        }
+        buf
+    }
+}
+
+/// Loads the authoritative room secret from DO storage, generating and persisting one if absent.
+pub async fn load_or_init_room_secret(state: &State) -> Result<[u8; 32]> {
+    let storage = state.storage();
+    if let Ok(Some(hex_secret)) = storage.get::<String>(ROOM_SECRET_STORAGE_KEY).await {
+        if let Ok(bytes) = hex::decode(hex_secret.trim()) {
+            if bytes.len() == 32 {
+                let mut secret = [0u8; 32];
+                secret.copy_from_slice(&bytes);
+                return Ok(secret);
+            }
+        }
+    }
+    let secret = generate_room_secret();
+    storage
+        .put(ROOM_SECRET_STORAGE_KEY, hex::encode(secret))
+        .await?;
+    Ok(secret)
+}
+
 /// Cloudflare Durable Object adapter for `GET /match/:do_id`.
+///
+/// Ensures the room secret exists in DO storage, performs atomic host election within
+/// `HOST_TTL_MS`, and returns `{ status, do_id, room_secret }`.
 pub async fn handle_do_match(
     state: &State,
     ephemeral: &RefCell<EphemeralRoomState>,
+    do_id: &str,
+    caller_peer_id: Option<&str>,
 ) -> Result<Response> {
-    let mut sockets = state.get_websockets_with_tag(HOST_WEBSOCKET_TAG);
-    if sockets.is_empty() {
-        sockets = state.get_websockets();
-    }
+    let room_secret = load_or_init_room_secret(state).await?;
+    ephemeral.borrow_mut().set_room_secret(room_secret);
 
-    let seed = generate_selector_seed();
-    let result = {
-        let room_state = ephemeral.borrow();
-        process_match_request(&room_state, &mut sockets, seed)
+    let storage = state.storage();
+    let now = now_ms();
+
+    let existing_host: Option<String> = storage
+        .get::<String>(HOST_PEER_ID_STORAGE_KEY)
+        .await
+        .ok()
+        .flatten();
+    let claimed_at: f64 = storage
+        .get::<f64>(HOST_CLAIMED_AT_STORAGE_KEY)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0.0);
+
+    let host_alive = existing_host.is_some() && (now - claimed_at) < HOST_TTL_MS;
+
+    let status = if !host_alive {
+        let peer = caller_peer_id.unwrap_or("anonymous").to_string();
+        storage.put(HOST_PEER_ID_STORAGE_KEY, peer).await?;
+        storage.put(HOST_CLAIMED_AT_STORAGE_KEY, now).await?;
+        "host"
+    } else if let Some(peer) = caller_peer_id {
+        if existing_host.as_deref() == Some(peer) {
+            "host"
+        } else {
+            "waiting"
+        }
+    } else {
+        "waiting"
     };
 
-    match result {
-        Ok(http_res) => {
-            let mut resp = Response::ok(&http_res.body)?;
-            resp.headers_mut().set("Content-Type", "application/json")?;
-            with_cors(resp)
-        }
-        Err(err) => with_cors(Response::error(err.to_string(), err.status_code())?),
-    }
+    let body = serde_json::json!({
+        "status": status,
+        "do_id": do_id,
+        "room_secret": hex::encode(room_secret),
+    });
+
+    let mut resp = Response::ok(serde_json::to_string(&body).unwrap_or_default())?;
+    resp.headers_mut().set("Content-Type", "application/json")?;
+    with_cors(resp)
 }
 
 /// Generates a pseudo-random selector seed for round-robin / randomized host selection.

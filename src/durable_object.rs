@@ -205,23 +205,37 @@ impl DurableObject for DeadDropRoom {
 
         match (req.method(), segments.as_slice()) {
             (Method::Get, ["host", _do_id]) => {
-                let expected = self.ephemeral.borrow().room_secret().copied();
-                let resp = handle_do_host_upgrade_with_secret(&req, &self.state, expected.as_ref())?;
-                if resp.status_code() == 101 && expected.is_none() {
-                    if let Some(sec_str) = crate::auth::extract_secret_from_request(&req) {
-                        if let Ok(parsed) = crate::auth::authenticate_host(Some(&sec_str), None) {
-                            self.ephemeral.borrow_mut().set_room_secret(parsed);
-                        }
+                // The DO is the authority on the room secret. Load (or lazily initialize)
+                // it from storage so subsequent /host calls must present the DO-issued token.
+                let expected = match crate::handlers::load_or_init_room_secret(&self.state).await {
+                    Ok(secret) => {
+                        self.ephemeral.borrow_mut().set_room_secret(secret);
+                        Some(secret)
                     }
-                }
+                    Err(_) => self.ephemeral.borrow().room_secret().copied(),
+                };
+                let resp =
+                    handle_do_host_upgrade_with_secret(&req, &self.state, expected.as_ref())?;
                 with_cors(resp)
             }
             (Method::Post, ["stage", _do_id]) => {
                 let resp = handle_do_stage_invite(&mut req, &self.state, &self.ephemeral).await?;
                 with_cors(resp)
             }
-            (Method::Get, ["match", _do_id]) => {
-                let resp = handle_do_match(&self.state, &self.ephemeral).await?;
+            (Method::Get, ["match", do_id]) => {
+                let caller_peer_id = req
+                    .headers()
+                    .get("X-Peer-Id")
+                    .ok()
+                    .flatten()
+                    .filter(|s| !s.trim().is_empty());
+                let resp = handle_do_match(
+                    &self.state,
+                    &self.ephemeral,
+                    do_id,
+                    caller_peer_id.as_deref(),
+                )
+                .await?;
                 with_cors(resp)
             }
             (Method::Post, ["drop", _do_id, invite_uuid]) => {
@@ -315,6 +329,17 @@ mod tests {
         assert_eq!(state.burned_count(), MAX_BURNED_UUIDS);
         assert!(!state.burn_uuid("uuid-overflow".to_string()));
         assert_eq!(state.burned_count(), MAX_BURNED_UUIDS);
+    }
+
+    #[test]
+    fn test_room_secret_hex_roundtrip_simulates_storage_persistence() {
+        // Simulates DO storage: hex-encode on write, decode on read.
+        let secret = crate::handlers::generate_room_secret();
+        let stored = hex::encode(secret);
+        let decoded = hex::decode(&stored).unwrap();
+        let mut recovered = [0u8; 32];
+        recovered.copy_from_slice(&decoded);
+        assert_eq!(recovered, secret);
     }
 
     #[test]

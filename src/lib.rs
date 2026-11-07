@@ -87,6 +87,9 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 
             with_cors(fresh_resp)
         })
+        .get_async("/match", |_req, _ctx| async move {
+            with_cors(Response::error("Missing Durable Object ID", 400)?)
+        })
         .get_async("/match/:do_id", |req, ctx| async move {
             let do_id = match ctx.param("do_id") {
                 Some(id) if !id.trim().is_empty() => id,
@@ -103,12 +106,19 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             };
 
             let status = resp.status_code();
+            let content_type = resp
+                .headers()
+                .get("Content-Type")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "application/json".to_string());
             let body_text = resp.text().await.unwrap_or_default();
             let fresh_resp = if (200..300).contains(&status) {
                 let mut r = Response::ok(body_text)?;
                 if status != 200 {
                     r = r.with_status(status);
                 }
+                r.headers_mut().set("Content-Type", &content_type)?;
                 r
             } else {
                 Response::error(body_text, status)?
