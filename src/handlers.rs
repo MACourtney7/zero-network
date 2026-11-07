@@ -40,7 +40,18 @@ pub struct StageInviteRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum MatchResponse {
+    /// Caller is the elected host for this room.
+    Host,
+    /// Caller is a joiner and has been assigned a staged invite.
+    Joiner {
+        invite: InvitePayload,
+        assigned_peer_id: String,
+    },
+    /// Caller is waiting for a host to stage an invite.
+    Waiting,
+    /// Legacy variant retained for backward compatibility with existing tests.
     Matched { invite: InvitePayload },
+    /// Legacy variant retained for backward compatibility with existing tests.
     Empty,
 }
 
@@ -731,41 +742,38 @@ pub fn now_ms() -> f64 {
 }
 
 /// Generates 32 cryptographically-random bytes for a fresh room secret.
+///
+/// Uses the platform CSPRNG (`crypto.getRandomValues` on wasm, `getrandom` on native).
+/// Panics only if the platform CSPRNG is unavailable, which is a fatal misconfiguration.
 pub fn generate_room_secret() -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    fill_secure_random(&mut buf)
+        .expect("platform CSPRNG unavailable: cannot generate room secret");
+    buf
+}
+
+/// Fills `buf` with cryptographically-secure random bytes from the platform CSPRNG.
+pub fn fill_secure_random(buf: &mut [u8]) -> std::result::Result<(), String> {
     #[cfg(target_arch = "wasm32")]
     {
         use worker::js_sys;
-        let mut buf = [0u8; 32];
-        let arr = js_sys::Uint8Array::new_with_length(32);
+        let len = buf.len();
+        let arr = js_sys::Uint8Array::new_with_length(len as u32);
         let crypto = js_sys::Reflect::get(&js_sys::global(), &js_sys::JsString::from("crypto"))
             .ok()
             .and_then(|c| {
                 js_sys::Reflect::get(&c, &js_sys::JsString::from("getRandomValues")).ok()
             })
-            .and_then(|f| f.dyn_ref::<js_sys::Function>().cloned());
-        if let Some(f) = crypto {
-            let _ = f.call1(&js_sys::JsValue::UNDEFINED, &arr);
-            arr.copy_to(&mut buf);
-        }
-        buf
+            .and_then(|f| f.dyn_ref::<js_sys::Function>().cloned())
+            .ok_or_else(|| "crypto.getRandomValues unavailable".to_string())?;
+        f.call1(&js_sys::JsValue::UNDEFINED, &arr)
+            .map_err(|_| "crypto.getRandomValues failed".to_string())?;
+        arr.copy_to(buf);
+        Ok(())
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let mut buf = [0u8; 32];
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let mut x = (nanos as u64) ^ 0x9E37_79B9_7F4A_7C15;
-        for chunk in buf.chunks_mut(8) {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            let bytes = x.to_le_bytes();
-            chunk.copy_from_slice(&bytes[..chunk.len()]);
-        }
-        buf
+        getrandom::getrandom(buf).map_err(|e| format!("getrandom failed: {e}"))
     }
 }
 
@@ -788,10 +796,30 @@ pub async fn load_or_init_room_secret(state: &State) -> Result<[u8; 32]> {
     Ok(secret)
 }
 
+/// Scans host sockets for the first unburned staged invite, returning it if present.
+pub fn find_staged_invite<S: HibernatingSocket>(
+    room_state: &EphemeralRoomState,
+    host_sockets: &[S],
+) -> Option<InvitePayload> {
+    for sock in host_sockets.iter() {
+        if let Ok(Some(att)) = sock.recover_host_secret() {
+            if let Some(ref inv) = att.staged_invite {
+                if !room_state.is_burned(&inv.invite_uuid) {
+                    return Some(inv.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Cloudflare Durable Object adapter for `GET /match/:do_id`.
 ///
-/// Ensures the room secret exists in DO storage, performs atomic host election within
-/// `HOST_TTL_MS`, and returns `{ status, do_id, room_secret }`.
+/// Ensures the room secret exists in DO storage, then resolves the caller's role:
+/// 1. If an unburned staged invite exists, returns `status: "joiner"` with the invite.
+/// 2. If the caller is the current host (lease still valid), refreshes the lease and returns `status: "host"`.
+/// 3. If another host holds a valid lease, returns `status: "waiting"`.
+/// 4. Otherwise elects the caller as host and returns `status: "host"`.
 pub async fn handle_do_match(
     state: &State,
     ephemeral: &RefCell<EphemeralRoomState>,
@@ -803,7 +831,36 @@ pub async fn handle_do_match(
 
     let storage = state.storage();
     let now = now_ms();
+    let peer = caller_peer_id
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("anonymous")
+        .to_string();
 
+    // 1. Check for a staged invite first — joiners get priority over host election.
+    let mut sockets = state.get_websockets_with_tag(HOST_WEBSOCKET_TAG);
+    if sockets.is_empty() {
+        sockets = state.get_websockets();
+    }
+    let staged_invite = {
+        let room_state = ephemeral.borrow();
+        find_staged_invite(&room_state, &sockets)
+    };
+
+    if let Some(invite) = staged_invite {
+        let body = serde_json::json!({
+            "status": "joiner",
+            "do_id": do_id,
+            "room_secret": hex::encode(room_secret),
+            "assigned_peer_id": peer,
+            "invite": invite,
+        });
+        let mut resp = Response::ok(serde_json::to_string(&body).unwrap_or_default())?;
+        resp.headers_mut().set("Content-Type", "application/json")?;
+        return with_cors(resp);
+    }
+
+    // 2. Host lease check / refresh / election.
     let existing_host: Option<String> = storage
         .get::<String>(HOST_PEER_ID_STORAGE_KEY)
         .await
@@ -816,21 +873,20 @@ pub async fn handle_do_match(
         .flatten()
         .unwrap_or(0.0);
 
-    let host_alive = existing_host.is_some() && (now - claimed_at) < HOST_TTL_MS;
+    let lease_valid = existing_host.is_some() && (now - claimed_at) < HOST_TTL_MS;
+    let caller_is_host = existing_host.as_deref() == Some(peer.as_str());
 
-    let status = if !host_alive {
-        let peer = caller_peer_id.unwrap_or("anonymous").to_string();
-        storage.put(HOST_PEER_ID_STORAGE_KEY, peer).await?;
+    let status = if lease_valid && caller_is_host {
+        // Refresh the lease so an active host is never evicted.
         storage.put(HOST_CLAIMED_AT_STORAGE_KEY, now).await?;
         "host"
-    } else if let Some(peer) = caller_peer_id {
-        if existing_host.as_deref() == Some(peer) {
-            "host"
-        } else {
-            "waiting"
-        }
-    } else {
+    } else if lease_valid {
         "waiting"
+    } else {
+        // Lease expired or no host: elect the caller.
+        storage.put(HOST_PEER_ID_STORAGE_KEY, peer.clone()).await?;
+        storage.put(HOST_CLAIMED_AT_STORAGE_KEY, now).await?;
+        "host"
     };
 
     let body = serde_json::json!({
