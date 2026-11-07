@@ -1077,6 +1077,109 @@ fn test_dead_drop_staged_invite_requires_hmac_and_clears_staged() {
 }
 
 #[test]
+fn test_dead_drop_pass2_selects_unstaged_socket_over_staged_different() {
+    let host_secret = [0x6Bu8; 32];
+    let host_hex = hex::encode(host_secret);
+
+    // Two host sockets sharing the same host secret.
+    let mut sock_0 = MockHostSocket::new();
+    process_host_upgrade(Some("websocket"), Some(&host_hex), &mut sock_0).expect("host 0 upgrade");
+    let mut sock_1 = MockHostSocket::new();
+    process_host_upgrade(Some("websocket"), Some(&host_hex), &mut sock_1).expect("host 1 upgrade");
+
+    // Socket 0 is staged for a DIFFERENT invite ("invite-B").
+    let invite_b_uuid = "invite-B";
+    let token_b = compute_invite_token(&host_secret, invite_b_uuid)
+        .expect("compute token B")
+        .hmac_hex;
+    let invite_b = sample_invite_payload("room-pass2", invite_b_uuid, &token_b, [0x11u8; 32]);
+    sock_0
+        .attach_host_secret(&HostAttachment::with_staged_invite(host_secret, invite_b.clone()))
+        .unwrap();
+
+    // Socket 1 has no staged invite.
+    assert!(sock_1
+        .recover_host_secret()
+        .unwrap()
+        .unwrap()
+        .staged_invite
+        .is_none());
+
+    let mut sockets = vec![sock_0, sock_1];
+    let mut room_state = EphemeralRoomState::new();
+
+    // Submit a dead drop for "invite-A" with a valid HMAC.
+    let invite_a_uuid = "invite-A";
+    let token_a = compute_invite_token(&host_secret, invite_a_uuid)
+        .expect("compute token A")
+        .hmac_hex;
+    let payload_a = sample_drop_payload(invite_a_uuid, &token_a);
+    let bytes_a = to_json_bytes(&payload_a).expect("serialize payload A");
+
+    let res = process_dead_drop(invite_a_uuid, None, &bytes_a, &mut room_state, &mut sockets)
+        .expect("dead drop for invite-A should succeed via un-staged socket");
+    assert_eq!(res.status, 200);
+
+    // Socket 0 (staged for invite-B) must NEVER receive the message.
+    assert!(
+        sockets[0].sent_messages.is_empty(),
+        "Socket 0 staged for invite-B must not receive invite-A's answer"
+    );
+    // Socket 1 (un-staged) must receive exactly one message.
+    assert_eq!(
+        sockets[1].sent_messages.len(),
+        1,
+        "Socket 1 (un-staged) must receive invite-A's answer"
+    );
+    let received: DropPayload = from_json_str(&sockets[1].sent_messages[0]).unwrap();
+    assert_eq!(received, payload_a);
+
+    // Socket 0's staged invite must remain untouched.
+    assert_eq!(
+        sockets[0]
+            .recover_host_secret()
+            .unwrap()
+            .unwrap()
+            .staged_invite,
+        Some(invite_b)
+    );
+
+    // Now stage Socket 1 for a DIFFERENT invite ("invite-C") as well.
+    let invite_c_uuid = "invite-C";
+    let token_c = compute_invite_token(&host_secret, invite_c_uuid)
+        .expect("compute token C")
+        .hmac_hex;
+    let invite_c = sample_invite_payload("room-pass2", invite_c_uuid, &token_c, [0x22u8; 32]);
+    sockets[1]
+        .attach_host_secret(&HostAttachment::with_staged_invite(host_secret, invite_c))
+        .unwrap();
+
+    // A dead drop for "invite-A" must now fail with ForbiddenHmac: no socket
+    // is un-staged, and neither staged socket matches invite-A.
+    let invite_a2_uuid = "invite-A2";
+    let token_a2 = compute_invite_token(&host_secret, invite_a2_uuid)
+        .expect("compute token A2")
+        .hmac_hex;
+    let payload_a2 = sample_drop_payload(invite_a2_uuid, &token_a2);
+    let bytes_a2 = to_json_bytes(&payload_a2).expect("serialize payload A2");
+
+    let err = process_dead_drop(
+        invite_a2_uuid,
+        None,
+        &bytes_a2,
+        &mut room_state,
+        &mut sockets,
+    )
+    .expect_err("dead drop must fail when all sockets are staged for other invites");
+    assert_eq!(err, NetworkError::ForbiddenHmac);
+    assert_eq!(err.status_code(), 403);
+
+    // Neither socket received the failed payload.
+    assert_eq!(sockets[0].sent_messages.len(), 0);
+    assert_eq!(sockets[1].sent_messages.len(), 1);
+}
+
+#[test]
 fn test_universal_cors_headers_and_options_preflight() {
     // 1. Target-independent preflight OPTIONS response returns 204 with universal CORS headers
     let preflight = HttpResponse::cors_preflight();

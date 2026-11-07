@@ -2,7 +2,6 @@
 //! for the stateless Cloudflare Worker & Hibernating Durable Object signaling bootstrap.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt;
 
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
@@ -418,17 +417,17 @@ pub fn process_dead_drop<S: HibernatingSocket>(
     }
 
     let mut found_any_attachment = false;
-    let mut matching_idx: Option<usize> = None;
+    let mut staged_match_idx: Option<usize> = None;
+    let mut hmac_match_idx: Option<usize> = None;
 
+    // Pass 1: prefer a socket that staged this exact invite AND whose HMAC verifies.
+    // A matching staged UUID alone is not sufficient authorization.
     for (idx, sock) in host_sockets.iter().enumerate() {
         if let Some(att) = sock
             .recover_host_secret()
             .map_err(NetworkError::SocketError)?
         {
             found_any_attachment = true;
-            // Route the drop to the exact host socket that staged this invite, but
-            // NEVER accept a staged-invite match without verifying the HMAC token.
-            // A matching staged UUID alone is not sufficient authorization.
             let staged_matches = att
                 .staged_invite
                 .as_ref()
@@ -437,8 +436,29 @@ pub fn process_dead_drop<S: HibernatingSocket>(
             if staged_matches
                 && verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok()
             {
-                matching_idx = Some(idx);
+                staged_match_idx = Some(idx);
                 break;
+            }
+        }
+    }
+
+    // Pass 2: fall back to any socket whose HMAC verifies AND that has no staged
+    // invite. This preserves backward compatibility with sockets that have no
+    // staged invite (e.g. direct host connections and unit tests) while strictly
+    // guaranteeing that a socket staged for a different invite is never selected
+    // as a fallback for this invite.
+    if staged_match_idx.is_none() {
+        for (idx, sock) in host_sockets.iter().enumerate() {
+            if let Some(att) = sock
+                .recover_host_secret()
+                .map_err(NetworkError::SocketError)?
+            {
+                if att.staged_invite.is_none()
+                    && verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok()
+                {
+                    hmac_match_idx = Some(idx);
+                    break;
+                }
             }
         }
     }
@@ -447,7 +467,10 @@ pub fn process_dead_drop<S: HibernatingSocket>(
         return Err(NetworkError::HostSocketUnavailable);
     }
 
-    let target_idx = matching_idx.ok_or(NetworkError::ForbiddenHmac)?;
+    let was_staged = staged_match_idx.is_some();
+    let target_idx = staged_match_idx
+        .or(hmac_match_idx)
+        .ok_or(NetworkError::ForbiddenHmac)?;
 
     // REQ-003.4: Replay detection & single-use invite burning in volatile memory.
     if room_state.is_burned(path_invite_uuid) {
@@ -457,22 +480,6 @@ pub fn process_dead_drop<S: HibernatingSocket>(
         return Err(NetworkError::BurnCapacityExceeded);
     }
 
-    // Clear the consumed staged invite on the matching host socket so it cannot be
-    // served again to another joiner via `/match` or `/invite`.
-    if let Ok(Some(mut att)) = host_sockets[target_idx].recover_host_secret() {
-        if att
-            .staged_invite
-            .as_ref()
-            .map(|i| i.invite_uuid.as_str())
-            == Some(path_invite_uuid)
-        {
-            att.staged_invite = None;
-            host_sockets[target_idx]
-                .attach_host_secret(&att)
-                .map_err(NetworkError::SocketError)?;
-        }
-    }
-
     // Pipe serialized DropPayload strictly to that matching host socket.
     let serialized =
         to_json_string(&payload).map_err(|e| NetworkError::InvalidDropPayload(e.to_string()))?;
@@ -480,6 +487,14 @@ pub fn process_dead_drop<S: HibernatingSocket>(
     host_sockets[target_idx]
         .send_text(&serialized)
         .map_err(NetworkError::SocketError)?;
+
+    // Clear staged invite only after successful send so failed delivery does not drop the reservation
+    if was_staged {
+        if let Ok(Some(mut att)) = host_sockets[target_idx].recover_host_secret() {
+            att.staged_invite = None;
+            let _ = host_sockets[target_idx].attach_host_secret(&att);
+        }
+    }
 
     Ok(HttpResponse {
         status: 200,

@@ -1,5 +1,51 @@
 # zero_network Codebase Dump
 
+## FILE: .github/workflows/deploy.yml
+```yaml
+name: Deploy zero_network
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout zero_network
+        uses: actions/checkout@v4
+        with:
+          path: zero_network
+
+      - name: Checkout zero_protocol sibling
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/zero-protocol
+          path: zero_protocol
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install worker-build
+        run: cargo install -q worker-build --version "^0.7"
+
+      - name: Deploy Cloudflare Worker & Durable Object
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: zero_network
+          command: deploy
+```
+
 ## FILE: .gitignore
 ```
 .DS_Store
@@ -444,7 +490,7 @@ impl EphemeralRoomState {
     pub fn reserve_uuid_for_peer(
         &mut self,
         invite_uuid: String,
-        peer_id: &str,
+        _peer_id: &str,
     ) -> bool {
         if self.burned_uuids.contains(&invite_uuid) || self.reserved_uuids.contains(&invite_uuid) {
             return false;
@@ -590,7 +636,13 @@ impl DurableObject for DeadDropRoom {
                 with_cors(resp)
             }
             (Method::Get, ["match", do_id]) => {
-                let caller_peer_id = req.headers().get("X-Peer-Id").ok().flatten();
+                let header_peer_id = req.headers().get("X-Peer-Id").ok().flatten();
+                let query_peer_id = req
+                    .url()
+                    .ok()
+                    .and_then(|u| crate::handlers::parse_query_peer_id(u.as_str()));
+                let caller_peer_id =
+                    crate::handlers::extract_peer_id(header_peer_id.as_deref(), query_peer_id.as_deref());
                 // Take a snapshot of election state, drop the borrow, then await.
                 let mut election_snapshot = self.election.borrow().clone();
                 let resp = handle_do_match(
@@ -606,7 +658,13 @@ impl DurableObject for DeadDropRoom {
                 with_cors(resp)
             }
             (Method::Get, ["invite", do_id]) => {
-                let caller_peer_id = req.headers().get("X-Peer-Id").ok().flatten();
+                let header_peer_id = req.headers().get("X-Peer-Id").ok().flatten();
+                let query_peer_id = req
+                    .url()
+                    .ok()
+                    .and_then(|u| crate::handlers::parse_query_peer_id(u.as_str()));
+                let caller_peer_id =
+                    crate::handlers::extract_peer_id(header_peer_id.as_deref(), query_peer_id.as_deref());
                 let mut election_snapshot = self.election.borrow().clone();
                 let resp = handle_do_match(
                     &self.state,
@@ -781,7 +839,6 @@ mod tests {
 //! for the stateless Cloudflare Worker & Hibernating Durable Object signaling bootstrap.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt;
 
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
@@ -844,7 +901,7 @@ pub enum MatchResponse {
 
 pub const CORS_ALLOW_ORIGIN: &str = "*";
 pub const CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
-pub const CORS_ALLOW_HEADERS: &str = "Content-Type, Authorization, X-Host-Secret";
+pub const CORS_ALLOW_HEADERS: &str = "Content-Type, Authorization, X-Host-Secret, X-Peer-Id";
 pub const CORS_MAX_AGE: &str = "86400";
 
 /// Returns standard CORS headers as key-value pairs.
@@ -1197,17 +1254,48 @@ pub fn process_dead_drop<S: HibernatingSocket>(
     }
 
     let mut found_any_attachment = false;
-    let mut matching_idx: Option<usize> = None;
+    let mut staged_match_idx: Option<usize> = None;
+    let mut hmac_match_idx: Option<usize> = None;
 
+    // Pass 1: prefer a socket that staged this exact invite AND whose HMAC verifies.
+    // A matching staged UUID alone is not sufficient authorization.
     for (idx, sock) in host_sockets.iter().enumerate() {
         if let Some(att) = sock
             .recover_host_secret()
             .map_err(NetworkError::SocketError)?
         {
             found_any_attachment = true;
-            if verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok() {
-                matching_idx = Some(idx);
+            let staged_matches = att
+                .staged_invite
+                .as_ref()
+                .map(|i| i.invite_uuid.as_str())
+                == Some(path_invite_uuid);
+            if staged_matches
+                && verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok()
+            {
+                staged_match_idx = Some(idx);
                 break;
+            }
+        }
+    }
+
+    // Pass 2: fall back to any socket whose HMAC verifies AND that has no staged
+    // invite. This preserves backward compatibility with sockets that have no
+    // staged invite (e.g. direct host connections and unit tests) while strictly
+    // guaranteeing that a socket staged for a different invite is never selected
+    // as a fallback for this invite.
+    if staged_match_idx.is_none() {
+        for (idx, sock) in host_sockets.iter().enumerate() {
+            if let Some(att) = sock
+                .recover_host_secret()
+                .map_err(NetworkError::SocketError)?
+            {
+                if att.staged_invite.is_none()
+                    && verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok()
+                {
+                    hmac_match_idx = Some(idx);
+                    break;
+                }
             }
         }
     }
@@ -1216,7 +1304,10 @@ pub fn process_dead_drop<S: HibernatingSocket>(
         return Err(NetworkError::HostSocketUnavailable);
     }
 
-    let target_idx = matching_idx.ok_or(NetworkError::ForbiddenHmac)?;
+    let was_staged = staged_match_idx.is_some();
+    let target_idx = staged_match_idx
+        .or(hmac_match_idx)
+        .ok_or(NetworkError::ForbiddenHmac)?;
 
     // REQ-003.4: Replay detection & single-use invite burning in volatile memory.
     if room_state.is_burned(path_invite_uuid) {
@@ -1233,6 +1324,14 @@ pub fn process_dead_drop<S: HibernatingSocket>(
     host_sockets[target_idx]
         .send_text(&serialized)
         .map_err(NetworkError::SocketError)?;
+
+    // Clear staged invite only after successful send so failed delivery does not drop the reservation
+    if was_staged {
+        if let Ok(Some(mut att)) = host_sockets[target_idx].recover_host_secret() {
+            att.staged_invite = None;
+            let _ = host_sockets[target_idx].attach_host_secret(&att);
+        }
+    }
 
     Ok(HttpResponse {
         status: 200,
@@ -1253,7 +1352,7 @@ pub fn with_cors(mut resp: Response) -> Result<Response> {
     headers.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")?;
     headers.set(
         "Access-Control-Allow-Headers",
-        "Content-Type, Authorization, X-Host-Secret",
+        "Content-Type, Authorization, X-Host-Secret, X-Peer-Id",
     )?;
     headers.set("Access-Control-Max-Age", "86400")?;
 
@@ -1915,6 +2014,28 @@ pub fn parse_query_peer_id(url_or_query: &str) -> Option<String> {
     None
 }
 
+/// Extracts the caller's peer id, preferring the `X-Peer-Id` header over the
+/// `?peer_id=` URL query parameter. Returns `None` if neither is present or
+/// both are empty after trimming.
+pub fn extract_peer_id(
+    x_peer_id: Option<&str>,
+    query_peer_id: Option<&str>,
+) -> Option<String> {
+    if let Some(header) = x_peer_id {
+        let trimmed = header.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(query) = query_peer_id {
+        let trimmed = query.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
 /// Validates and normalizes the caller's `X-Peer-Id` header value.
 ///
 /// Returns `Ok(peer_id)` when a non-empty trimmed peer id is present, or
@@ -1961,10 +2082,10 @@ pub use durable_object::{
 };
 pub use handlers::{
     build_default_stun_response, cors_preflight_response, default_ice_servers_json,
-    extract_bearer_token, get_env_var, handle_do_match, handle_do_stage_invite, handle_ice_config,
-    parse_custom_ice_servers, parse_host_secret, process_dead_drop, process_host_upgrade,
-    process_ice_servers, process_match_request, process_stage_invite, with_cors, HttpResponse,
-    MatchResponse, NetworkError, StageInviteRequest, MAX_DROP_BODY_BYTES,
+    extract_bearer_token, extract_peer_id, get_env_var, handle_do_match, handle_do_stage_invite,
+    handle_ice_config, parse_custom_ice_servers, parse_host_secret, process_dead_drop,
+    process_host_upgrade, process_ice_servers, process_match_request, process_stage_invite,
+    with_cors, HttpResponse, MatchResponse, NetworkError, StageInviteRequest, MAX_DROP_BODY_BYTES,
 };
 
 use worker::{event, Context, Env, Method, Request, Response, Result, Router};
@@ -1983,6 +2104,7 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         .options("/host/:do_id", |_, _| cors_preflight_response())
         .options("/stage/:do_id", |_, _| cors_preflight_response())
         .options("/match/:do_id", |_, _| cors_preflight_response())
+        .options("/invite/:do_id", |_, _| cors_preflight_response())
         .options("/drop/:do_id/:invite_uuid", |_, _| {
             cors_preflight_response()
         })
@@ -2037,6 +2159,42 @@ pub async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         })
         .get_async("/match", |_req, _ctx| async move {
             with_cors(Response::error("Missing Durable Object ID", 400)?)
+        })
+        .get_async("/invite/:do_id", |req, ctx| async move {
+            let do_id = match ctx.param("do_id") {
+                Some(id) if !id.trim().is_empty() => id,
+                _ => return with_cors(Response::error("Missing Durable Object ID", 400)?),
+            };
+            let namespace = ctx.durable_object(DEAD_DROP_BINDING)?;
+            let stub = namespace.id_from_name(do_id)?.get_stub()?;
+            let mut resp = match stub.fetch_with_request(req).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err_resp = Response::error(format!("Durable Object error: {e}"), 500)?;
+                    return with_cors(err_resp);
+                }
+            };
+
+            let status = resp.status_code();
+            let content_type = resp
+                .headers()
+                .get("Content-Type")
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "application/json".to_string());
+            let body_text = resp.text().await.unwrap_or_default();
+            let fresh_resp = if (200..300).contains(&status) {
+                let mut r = Response::ok(body_text)?;
+                if status != 200 {
+                    r = r.with_status(status);
+                }
+                r.headers_mut().set("Content-Type", &content_type)?;
+                r
+            } else {
+                Response::error(body_text, status)?
+            };
+
+            with_cors(fresh_resp)
         })
         .get_async("/match/:do_id", |req, ctx| async move {
             let do_id = match ctx.param("do_id") {
@@ -2322,8 +2480,8 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use zero_network::{
     authenticate_host, constant_time_eq, default_ice_servers_json, extract_bearer_token,
-    extract_secret_from_params, parse_custom_ice_servers, parse_host_secret, parse_query_secret,
-    process_dead_drop, process_host_query_upgrade, process_host_upgrade,
+    extract_peer_id, extract_secret_from_params, parse_custom_ice_servers, parse_host_secret,
+    parse_query_secret, process_dead_drop, process_host_query_upgrade, process_host_upgrade,
     process_host_upgrade_authenticated, process_ice_servers, process_match_request,
     process_stage_invite, EphemeralRoomState, HibernatingSocket, HostAttachment, HttpResponse,
     MatchResponse, MockHostSocket, NetworkError, StageInviteRequest, MAX_BURNED_UUIDS,
@@ -3298,6 +3456,205 @@ fn test_host_query_secret_authentication() {
 }
 
 #[test]
+fn test_extract_peer_id_precedence_and_trimming() {
+    // Header takes precedence over query parameter.
+    assert_eq!(
+        extract_peer_id(Some("header-peer"), Some("query-peer")),
+        Some("header-peer".to_string())
+    );
+
+    // Whitespace around the header value is trimmed.
+    assert_eq!(
+        extract_peer_id(Some("   header-peer   "), None),
+        Some("header-peer".to_string())
+    );
+
+    // Whitespace around the query value is trimmed when header is absent.
+    assert_eq!(
+        extract_peer_id(None, Some("  query-peer  ")),
+        Some("query-peer".to_string())
+    );
+
+    // Empty/whitespace header falls back to query.
+    assert_eq!(
+        extract_peer_id(Some("   "), Some("query-peer")),
+        Some("query-peer".to_string())
+    );
+
+    // Both empty -> None.
+    assert_eq!(extract_peer_id(Some(""), Some("   ")), None);
+    assert_eq!(extract_peer_id(None, None), None);
+}
+
+#[test]
+fn test_dead_drop_staged_invite_requires_hmac_and_clears_staged() {
+    let host_secret = [0x5Au8; 32];
+    let invite_uuid = "staged-invite-hmac-required";
+
+    // Host upgrades and stages an invite on its socket.
+    let mut host_socket = MockHostSocket::new();
+    process_host_upgrade(
+        Some("websocket"),
+        Some(&hex::encode(host_secret)),
+        &mut host_socket,
+    )
+    .expect("host upgrade");
+
+    let valid_token = compute_invite_token(&host_secret, invite_uuid)
+        .expect("compute token")
+        .hmac_hex;
+    let invite = sample_invite_payload("room-staged", invite_uuid, &valid_token, [0x66u8; 32]);
+    host_socket
+        .attach_host_secret(&HostAttachment::with_staged_invite(host_secret, invite))
+        .unwrap();
+
+    let mut sockets = vec![host_socket];
+    let mut room_state = EphemeralRoomState::new();
+
+    // 1. Matching staged invite UUID but INVALID token must be rejected with 403.
+    let bad_payload = sample_drop_payload(invite_uuid, "deadbeef-invalid-hmac");
+    let bad_bytes = to_json_bytes(&bad_payload).expect("serialize bad payload");
+
+    let err = process_dead_drop(invite_uuid, None, &bad_bytes, &mut room_state, &mut sockets)
+        .expect_err("staged match with invalid HMAC must be rejected");
+    assert_eq!(err, NetworkError::ForbiddenHmac);
+    assert_eq!(err.status_code(), 403);
+
+    // Invite must NOT be burned, no message sent, and staged invite must remain.
+    assert!(!room_state.is_burned(invite_uuid));
+    assert!(sockets[0].sent_messages.is_empty());
+    assert!(sockets[0]
+        .recover_host_secret()
+        .unwrap()
+        .unwrap()
+        .staged_invite
+        .is_some());
+
+    // 2. Matching staged invite UUID with VALID token succeeds and clears staged invite.
+    let good_payload = sample_drop_payload(invite_uuid, &valid_token);
+    let good_bytes = to_json_bytes(&good_payload).expect("serialize good payload");
+
+    let res = process_dead_drop(invite_uuid, None, &good_bytes, &mut room_state, &mut sockets)
+        .expect("staged match with valid HMAC should succeed");
+    assert_eq!(res.status, 200);
+
+    // Invite burned, message delivered, staged invite cleared.
+    assert!(room_state.is_burned(invite_uuid));
+    assert_eq!(sockets[0].sent_messages.len(), 1);
+    let received: DropPayload = from_json_str(&sockets[0].sent_messages[0]).unwrap();
+    assert_eq!(received, good_payload);
+    assert!(sockets[0]
+        .recover_host_secret()
+        .unwrap()
+        .unwrap()
+        .staged_invite
+        .is_none());
+}
+
+#[test]
+fn test_dead_drop_pass2_selects_unstaged_socket_over_staged_different() {
+    let host_secret = [0x6Bu8; 32];
+    let host_hex = hex::encode(host_secret);
+
+    // Two host sockets sharing the same host secret.
+    let mut sock_0 = MockHostSocket::new();
+    process_host_upgrade(Some("websocket"), Some(&host_hex), &mut sock_0).expect("host 0 upgrade");
+    let mut sock_1 = MockHostSocket::new();
+    process_host_upgrade(Some("websocket"), Some(&host_hex), &mut sock_1).expect("host 1 upgrade");
+
+    // Socket 0 is staged for a DIFFERENT invite ("invite-B").
+    let invite_b_uuid = "invite-B";
+    let token_b = compute_invite_token(&host_secret, invite_b_uuid)
+        .expect("compute token B")
+        .hmac_hex;
+    let invite_b = sample_invite_payload("room-pass2", invite_b_uuid, &token_b, [0x11u8; 32]);
+    sock_0
+        .attach_host_secret(&HostAttachment::with_staged_invite(host_secret, invite_b.clone()))
+        .unwrap();
+
+    // Socket 1 has no staged invite.
+    assert!(sock_1
+        .recover_host_secret()
+        .unwrap()
+        .unwrap()
+        .staged_invite
+        .is_none());
+
+    let mut sockets = vec![sock_0, sock_1];
+    let mut room_state = EphemeralRoomState::new();
+
+    // Submit a dead drop for "invite-A" with a valid HMAC.
+    let invite_a_uuid = "invite-A";
+    let token_a = compute_invite_token(&host_secret, invite_a_uuid)
+        .expect("compute token A")
+        .hmac_hex;
+    let payload_a = sample_drop_payload(invite_a_uuid, &token_a);
+    let bytes_a = to_json_bytes(&payload_a).expect("serialize payload A");
+
+    let res = process_dead_drop(invite_a_uuid, None, &bytes_a, &mut room_state, &mut sockets)
+        .expect("dead drop for invite-A should succeed via un-staged socket");
+    assert_eq!(res.status, 200);
+
+    // Socket 0 (staged for invite-B) must NEVER receive the message.
+    assert!(
+        sockets[0].sent_messages.is_empty(),
+        "Socket 0 staged for invite-B must not receive invite-A's answer"
+    );
+    // Socket 1 (un-staged) must receive exactly one message.
+    assert_eq!(
+        sockets[1].sent_messages.len(),
+        1,
+        "Socket 1 (un-staged) must receive invite-A's answer"
+    );
+    let received: DropPayload = from_json_str(&sockets[1].sent_messages[0]).unwrap();
+    assert_eq!(received, payload_a);
+
+    // Socket 0's staged invite must remain untouched.
+    assert_eq!(
+        sockets[0]
+            .recover_host_secret()
+            .unwrap()
+            .unwrap()
+            .staged_invite,
+        Some(invite_b)
+    );
+
+    // Now stage Socket 1 for a DIFFERENT invite ("invite-C") as well.
+    let invite_c_uuid = "invite-C";
+    let token_c = compute_invite_token(&host_secret, invite_c_uuid)
+        .expect("compute token C")
+        .hmac_hex;
+    let invite_c = sample_invite_payload("room-pass2", invite_c_uuid, &token_c, [0x22u8; 32]);
+    sockets[1]
+        .attach_host_secret(&HostAttachment::with_staged_invite(host_secret, invite_c))
+        .unwrap();
+
+    // A dead drop for "invite-A" must now fail with ForbiddenHmac: no socket
+    // is un-staged, and neither staged socket matches invite-A.
+    let invite_a2_uuid = "invite-A2";
+    let token_a2 = compute_invite_token(&host_secret, invite_a2_uuid)
+        .expect("compute token A2")
+        .hmac_hex;
+    let payload_a2 = sample_drop_payload(invite_a2_uuid, &token_a2);
+    let bytes_a2 = to_json_bytes(&payload_a2).expect("serialize payload A2");
+
+    let err = process_dead_drop(
+        invite_a2_uuid,
+        None,
+        &bytes_a2,
+        &mut room_state,
+        &mut sockets,
+    )
+    .expect_err("dead drop must fail when all sockets are staged for other invites");
+    assert_eq!(err, NetworkError::ForbiddenHmac);
+    assert_eq!(err.status_code(), 403);
+
+    // Neither socket received the failed payload.
+    assert_eq!(sockets[0].sent_messages.len(), 0);
+    assert_eq!(sockets[1].sent_messages.len(), 1);
+}
+
+#[test]
 fn test_universal_cors_headers_and_options_preflight() {
     // 1. Target-independent preflight OPTIONS response returns 204 with universal CORS headers
     let preflight = HttpResponse::cors_preflight();
@@ -3312,7 +3669,7 @@ fn test_universal_cors_headers_and_options_preflight() {
     );
     assert_eq!(
         preflight.get_header("Access-Control-Allow-Headers"),
-        Some("Content-Type, Authorization, X-Host-Secret")
+        Some("Content-Type, Authorization, X-Host-Secret, X-Peer-Id")
     );
     assert_eq!(
         preflight.get_header("Access-Control-Max-Age"),
@@ -3332,7 +3689,7 @@ fn test_universal_cors_headers_and_options_preflight() {
     );
     assert_eq!(
         ice_resp.get_header("Access-Control-Allow-Headers"),
-        Some("Content-Type, Authorization, X-Host-Secret")
+        Some("Content-Type, Authorization, X-Host-Secret, X-Peer-Id")
     );
 
     // 3. /match/:do_id standard response has CORS headers attached
@@ -3351,7 +3708,7 @@ fn test_universal_cors_headers_and_options_preflight() {
     );
     assert_eq!(
         match_resp.get_header("Access-Control-Allow-Headers"),
-        Some("Content-Type, Authorization, X-Host-Secret")
+        Some("Content-Type, Authorization, X-Host-Secret, X-Peer-Id")
     );
 
     // 4. /stage/:do_id standard response has CORS headers attached
@@ -3387,7 +3744,7 @@ fn test_universal_cors_headers_and_options_preflight() {
     );
     assert_eq!(
         stage_resp.get_header("Access-Control-Allow-Headers"),
-        Some("Content-Type, Authorization, X-Host-Secret")
+        Some("Content-Type, Authorization, X-Host-Secret, X-Peer-Id")
     );
 
     // 5. In Wasm runtime contexts, verify worker::Response wrappers directly
@@ -3497,20 +3854,5 @@ class_name = "DeadDropRoom"
 # Set via: wrangler secret put CF_TURN_KEY_ID
 # Set via: wrangler secret put CF_TURN_API_TOKEN
 # Optional fallback override: TURN_SERVERS_JSON
-```
-
-## FILE: zero_network/src/durable_object.rs
-```rust
-
-```
-
-## FILE: zero_network/src/handlers.rs
-```rust
-
-```
-
-## FILE: zero_network/tests/mesh_flow_test.rs
-```rust
-
 ```
 

@@ -224,7 +224,7 @@ impl EphemeralRoomState {
     pub fn reserve_uuid_for_peer(
         &mut self,
         invite_uuid: String,
-        peer_id: &str,
+        _peer_id: &str,
     ) -> bool {
         if self.burned_uuids.contains(&invite_uuid) || self.reserved_uuids.contains(&invite_uuid) {
             return false;
