@@ -125,6 +125,7 @@ impl HibernatingSocket for MockHostSocket {
 #[derive(Debug, Default, Clone)]
 pub struct EphemeralRoomState {
     burned_uuids: HashSet<String>,
+    reserved_uuids: HashSet<String>,
     room_secret: Option<[u8; 32]>,
 }
 
@@ -132,6 +133,7 @@ impl EphemeralRoomState {
     pub fn new() -> Self {
         Self {
             burned_uuids: HashSet::new(),
+            reserved_uuids: HashSet::new(),
             room_secret: None,
         }
     }
@@ -139,6 +141,7 @@ impl EphemeralRoomState {
     pub fn with_room_secret(room_secret: [u8; 32]) -> Self {
         Self {
             burned_uuids: HashSet::new(),
+            reserved_uuids: HashSet::new(),
             room_secret: Some(room_secret),
         }
     }
@@ -170,6 +173,28 @@ impl EphemeralRoomState {
     /// Returns the number of burned invite UUIDs currently held in volatile memory.
     pub fn burned_count(&self) -> usize {
         self.burned_uuids.len()
+    }
+
+    /// Returns `true` if `invite_uuid` has already been reserved by a joiner.
+    pub fn is_reserved(&self, invite_uuid: &str) -> bool {
+        self.reserved_uuids.contains(invite_uuid)
+    }
+
+    /// Atomically reserves `invite_uuid` for a single joiner.
+    /// Returns `false` if already reserved/burned or if `MAX_BURNED_UUIDS` is reached.
+    pub fn reserve_uuid(&mut self, invite_uuid: String) -> bool {
+        if self.burned_uuids.contains(&invite_uuid) || self.reserved_uuids.contains(&invite_uuid) {
+            return false;
+        }
+        if self.reserved_uuids.len() >= MAX_BURNED_UUIDS {
+            return false;
+        }
+        self.reserved_uuids.insert(invite_uuid)
+    }
+
+    /// Returns the number of reserved invite UUIDs currently held in volatile memory.
+    pub fn reserved_count(&self) -> usize {
+        self.reserved_uuids.len()
     }
 }
 
