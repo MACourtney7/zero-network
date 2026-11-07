@@ -467,6 +467,7 @@ pub fn process_dead_drop<S: HibernatingSocket>(
         return Err(NetworkError::HostSocketUnavailable);
     }
 
+    let was_staged = staged_match_idx.is_some();
     let target_idx = staged_match_idx
         .or(hmac_match_idx)
         .ok_or(NetworkError::ForbiddenHmac)?;
@@ -479,22 +480,6 @@ pub fn process_dead_drop<S: HibernatingSocket>(
         return Err(NetworkError::BurnCapacityExceeded);
     }
 
-    // Clear the consumed staged invite on the matching host socket so it cannot be
-    // served again to another joiner via `/match` or `/invite`.
-    if let Ok(Some(mut att)) = host_sockets[target_idx].recover_host_secret() {
-        if att
-            .staged_invite
-            .as_ref()
-            .map(|i| i.invite_uuid.as_str())
-            == Some(path_invite_uuid)
-        {
-            att.staged_invite = None;
-            host_sockets[target_idx]
-                .attach_host_secret(&att)
-                .map_err(NetworkError::SocketError)?;
-        }
-    }
-
     // Pipe serialized DropPayload strictly to that matching host socket.
     let serialized =
         to_json_string(&payload).map_err(|e| NetworkError::InvalidDropPayload(e.to_string()))?;
@@ -502,6 +487,14 @@ pub fn process_dead_drop<S: HibernatingSocket>(
     host_sockets[target_idx]
         .send_text(&serialized)
         .map_err(NetworkError::SocketError)?;
+
+    // Clear staged invite only after successful send so failed delivery does not drop the reservation
+    if was_staged {
+        if let Ok(Some(mut att)) = host_sockets[target_idx].recover_host_secret() {
+            att.staged_invite = None;
+            let _ = host_sockets[target_idx].attach_host_secret(&att);
+        }
+    }
 
     Ok(HttpResponse {
         status: 200,
