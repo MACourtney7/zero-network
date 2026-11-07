@@ -13,10 +13,10 @@ pub use durable_object::{
 };
 pub use handlers::{
     build_default_stun_response, cors_preflight_response, default_ice_servers_json,
-    extract_bearer_token, get_env_var, handle_do_match, handle_do_stage_invite, handle_ice_config,
-    parse_custom_ice_servers, parse_host_secret, process_dead_drop, process_host_upgrade,
-    process_ice_servers, process_match_request, process_stage_invite, with_cors, HttpResponse,
-    MatchResponse, NetworkError, StageInviteRequest, MAX_DROP_BODY_BYTES,
+    extract_bearer_token, extract_peer_id, get_env_var, handle_do_match, handle_do_stage_invite,
+    handle_ice_config, parse_custom_ice_servers, parse_host_secret, process_dead_drop,
+    process_host_upgrade, process_ice_servers, process_match_request, process_stage_invite,
+    with_cors, HttpResponse, MatchResponse, NetworkError, StageInviteRequest, MAX_DROP_BODY_BYTES,
 };
 
 use worker::{event, Context, Env, Method, Request, Response, Result, Router};

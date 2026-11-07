@@ -2,7 +2,6 @@
 //! for the stateless Cloudflare Worker & Hibernating Durable Object signaling bootstrap.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fmt;
 
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
