@@ -8,6 +8,8 @@ use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_S
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use worker::{Headers, Request, RequestInit, Response, Result, State, WebSocketPair};
+#[cfg(target_arch = "wasm32")]
+use worker::wasm_bindgen::JsCast;
 use zero_protocol::crypto::verify_invite_token;
 use zero_protocol::{from_json_bytes, to_json_string, DropPayload, InvitePayload};
 
