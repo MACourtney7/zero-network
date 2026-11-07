@@ -442,16 +442,20 @@ pub fn process_dead_drop<S: HibernatingSocket>(
         }
     }
 
-    // Pass 2: fall back to any socket whose HMAC verifies. This preserves
-    // backward compatibility with sockets that have no staged invite (e.g.
-    // direct host connections and unit tests).
+    // Pass 2: fall back to any socket whose HMAC verifies AND that has no staged
+    // invite. This preserves backward compatibility with sockets that have no
+    // staged invite (e.g. direct host connections and unit tests) while strictly
+    // guaranteeing that a socket staged for a different invite is never selected
+    // as a fallback for this invite.
     if staged_match_idx.is_none() {
         for (idx, sock) in host_sockets.iter().enumerate() {
             if let Some(att) = sock
                 .recover_host_secret()
                 .map_err(NetworkError::SocketError)?
             {
-                if verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok() {
+                if att.staged_invite.is_none()
+                    && verify_invite_token(&att.host_secret, path_invite_uuid, token).is_ok()
+                {
                     hmac_match_idx = Some(idx);
                     break;
                 }
