@@ -1094,7 +1094,7 @@ fn test_dead_drop_pass2_selects_unstaged_socket_over_staged_different() {
         .hmac_hex;
     let invite_b = sample_invite_payload("room-pass2", invite_b_uuid, &token_b, [0x11u8; 32]);
     sock_0
-        .attach_host_secret(&HostAttachment::with_staged_invite(host_secret, invite_b))
+        .attach_host_secret(&HostAttachment::with_staged_invite(host_secret, invite_b.clone()))
         .unwrap();
 
     // Socket 1 has no staged invite.
