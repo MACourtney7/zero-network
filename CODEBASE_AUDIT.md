@@ -34,8 +34,17 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            zero_network -> target
+            zero_protocol -> target
+
       - name: Install worker-build
-        run: cargo install -q worker-build --version "^0.7"
+        uses: taiki-e/install-action@v2
+        with:
+          tool: worker-build
 
       - name: Check Cloudflare Credentials
         id: check_creds
